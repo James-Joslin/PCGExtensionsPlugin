@@ -1,0 +1,43 @@
+# ==========================================
+# Unreal Engine Standard Ignores
+# ==========================================
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+NoRedist/
+DataCache/
+Obj/
+*.suo
+*.user
+*.useroscc
+*.sln
+*.target
+*.modules
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# ==========================================
+# Project & Plugin Specific Ignores
+# ==========================================
+Plugins/PCGExtensions/Binaries/
+Plugins/PCGExtensions/Intermediate/
+
+# Ignore auto-generated IDE project schemas and workspaces at the root
+.vs/
+.idea/
+.vscode/
+*.Visualstudio.x64.user
+
+# ==========================================
+# Source Control & Backup Safeguards
+# ==========================================
+*.log
+*.crash
+*.dmp
+.DS_Store
+Thumbs.db
