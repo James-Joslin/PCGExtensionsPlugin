@@ -17,7 +17,7 @@
 // fallback is used (top face only).
 //
 // Place in your project's Source/<Module>/Public/ directory.
-// Requires "PCG" and "RenderCore" in Build.cs PublicDependencyModuleNames.
+// Requires "PCG" and "Landscape" in Build.cs PublicDependencyModuleNames.
 
 #pragma once
 
@@ -54,7 +54,7 @@ struct FPCGSurfGrassMeshEntry
 // ─────────────────────────────────────────────
 
 UCLASS(BlueprintType, ClassGroup = (Procedural))
-class UPCGMeshSurfaceScatterSettings : public UPCGSettings
+class PCGEXTENSIONS_API UPCGMeshSurfaceScatterSettings : public UPCGSettings
 {
 	GENERATED_BODY()
 
@@ -177,18 +177,6 @@ public:
 		meta = (EditCondition = "bRejectSubmerged", ClampMin = "-50.0", ClampMax = "200.0"))
 	float MinHeightAboveLandscape = 5.0f;
 
-	/**
-	 * Height tolerance (UU) for identifying "the rock itself" vs landscape during
-	 * the submerged-rejection multi-trace. Trace hits whose Z is within this
-	 * distance of (or above) the sample Z are assumed to be the rock's own
-	 * collision and are skipped; the first hit below this window is treated as
-	 * the landscape/ground surface. Increase for rocks with coarse collision
-	 * that differs significantly from the render mesh.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landscape",
-		meta = (EditCondition = "bRejectSubmerged", ClampMin = "5.0", ClampMax = "500.0"))
-	float RockCollisionTolerance = 50.0f;
-
 	// ── Noise (density variation across the mesh surface) ─────────
 
 	/** Enable Perlin-noise density modulation on the mesh surface. */
@@ -266,7 +254,7 @@ public:
 //  Element
 // ─────────────────────────────────────────────
 
-class FPCGMeshSurfaceScatterElement : public IPCGElement
+class PCGEXTENSIONS_API FPCGMeshSurfaceScatterElement : public IPCGElement
 {
 protected:
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;

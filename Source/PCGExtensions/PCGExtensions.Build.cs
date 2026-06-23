@@ -27,7 +27,8 @@ public class PCGExtensions : ModuleRules
                 "CoreUObject",
                 "Engine",
                 "InputCore",
-                "PCG" // Required for UPCGBlueprintElement, FPCGPoint, etc.
+                "PCG", // Required for UPCGBlueprintElement, FPCGPoint, etc.
+                "Landscape"
 			}
         );
 

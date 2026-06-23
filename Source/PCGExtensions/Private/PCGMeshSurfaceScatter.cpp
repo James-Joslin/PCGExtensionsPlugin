@@ -17,6 +17,7 @@
 #include "CollisionQueryParams.h"
 #include "GameFramework/Actor.h"
 #include "Components/StaticMeshComponent.h"
+#include "LandscapeProxy.h"
 #include "EngineUtils.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(PCGMeshSurfaceScatter)
@@ -715,9 +716,9 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 			const FVector SampleNormal = Tri.Normal;
 
 			// 5. Submerged rejection — multi-trace to landscape, reject if below terrain.
-			//    The trace from above will hit the rock's own collision first. We skip
-			//    hits near the sample Z (those are the rock) and take the first hit
-			//    that's clearly below the sample as the landscape/ground surface.
+			//    Walk all hits and find the one belonging to an ALandscapeProxy actor.
+			//    This avoids the rock's own ISM collision entirely — no Z-proximity
+			//    guessing needed.
 			if (Settings->bRejectSubmerged)
 			{
 				const FVector TraceStart(SamplePos.X, SamplePos.Y,
@@ -728,24 +729,21 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 				World->LineTraceMultiByChannel(Hits, TraceStart, TraceEnd,
 					Settings->LandscapeTraceChannel, TraceParams);
 
-				// Walk hits top-to-bottom. Skip anything at or above
-				// (SampleZ - RockCollisionTolerance) — those are the rock's own
-				// collision hull. The first hit below that window is the ground.
-				const float RockFloor = SamplePos.Z - Settings->RockCollisionTolerance;
+				// Find the landscape hit by actor type.
 				float LandscapeZ = -BIG_NUMBER;
 				for (const FHitResult& H : Hits)
 				{
-					if (H.ImpactPoint.Z > RockFloor)
+					AActor* HitActor = H.GetActor();
+					if (HitActor && HitActor->IsA<ALandscapeProxy>())
 					{
-						continue; // still within the rock's collision envelope
+						LandscapeZ = H.ImpactPoint.Z;
+						break;
 					}
-					LandscapeZ = H.ImpactPoint.Z;
-					break;
 				}
 
 				if (LandscapeZ > -BIG_NUMBER + 1.0f)
 				{
-					// Landscape found beneath. Reject if sample is at or below it.
+					// Landscape found. Reject if sample sits at or below terrain.
 					if (SamplePos.Z < LandscapeZ + Settings->MinHeightAboveLandscape)
 					{
 						++RockSubmerged;
