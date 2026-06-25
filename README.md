@@ -1,5 +1,9 @@
 # PCG Extensions Plugin — Unreal Engine 5.7
 
+## 🎬 Demo
+
+![Rock formation generation demo](images/preview-gif.gif)
+
 A native C++ plugin that extends Unreal Engine's Procedural Content Generation (PCG) framework with consolidated, high-performance nodes. Each node replaces a chain of built-in nodes (Surface Sampler → Normal To Density → Density Filter → Self Pruning → …) with a single execution block that handles the full pipeline internally — fewer graph nodes, less metadata overhead, faster iteration.
 
 Built for open-world landscape population: rocks on slopes, multi-tier formations on flat ground, tiered vegetation, high-density grass, and foliage on rock surfaces.
@@ -17,8 +21,6 @@ Embeds rocks into terrain at the correct depth regardless of slope angle. Instea
 `Surface Sampler → Normal To Density → Density Filter → Dynamic Mesh Embed → Transform Points → Static Mesh Spawner`
 
 The node assigns a weighted-random mesh from a configured set, writes the path as a `MeshPath` attribute, computes the embed offset from the mesh bounds and surface normal, and shifts the point into the surface. Feed the output into a Static Mesh Spawner set to "By Attribute" on `MeshPath`.
-
-![Slope rocks graph](Resources/Screenshots/slopes_graph.png)
 
 ---
 
@@ -54,8 +56,6 @@ Generates multi-tier rock formations (foundation clusters, mid-tier rocks, cap f
 
 `Surface Sampler → Normal To Density → Density Filter → Difference (subtract slope volumes) → Rock Formation Generator → Static Mesh Spawner`
 
-![Flat surface formations graph](Resources/Screenshots/flat_surfaces_graph.png)
-
 In the flat surfaces graph, the Difference node subtracts the slope rock volumes from the candidate landscape so formations only generate on open flat ground. The Formation Generator output goes straight to a By-Attribute Static Mesh Spawner — no intermediate Transform Points needed since the node handles scale/rotation internally.
 
 ---
@@ -67,8 +67,6 @@ Places one vegetation tier (large trees, medium trees, or shrubs) from an input 
 **Typical wiring:**
 
 `Surface Sampler → Difference (subtract rock zones) → Tiered Vegetation Scatter → Static Mesh Spawner`
-
-![Tiered vegetation graph](Resources/Screenshots/tiered_foliage_graph.png)
 
 The node is instanced once per tier with different settings. The `Out` pin carries the main vegetation (e.g. large trees placed with the node's own mesh assignment). The `Companions` pin carries companion ring points that reference the meshes the node assigned — feed these to a separate Transform Points → Static Mesh Spawner chain for understory plants around each tree. Rock zone exclusion is handled by feeding the Union of all rock spawner outputs into the Difference node upstream.
 
@@ -82,8 +80,6 @@ Ultra-high-throughput grass and ground-cover placement. Takes a dense candidate 
 
 `Surface Sampler → Difference (subtract exclusion zones) → Ground Cover Scatter → Static Mesh Spawner`
 
-![Ground cover graph](Resources/Screenshots/ground_cover_graph.png)
-
 The Exclusion Zones input on the parent graph carries the Union of all rock spawner outputs. The Difference node subtracts these footprints from the landscape sample before the points reach Ground Cover Scatter. The node assigns grass meshes via a weighted set and writes `MeshPath` for the By-Attribute spawner.
 
 ---
@@ -95,8 +91,6 @@ Samples the actual triangle geometry of rock meshes and places grass/foliage onl
 **Typical wiring:**
 
 `Rock Spawner Out (with MeshPath) → Mesh Surface Scatter → Static Mesh Spawner`
-
-![Mesh surface scatter graph](Resources/Screenshots/mesh_surface_scatter_graph.png)
 
 Takes the individual mesh bounds output from both rock graphs (slopes and flat surfaces). Each rock point's `MeshPath` attribute is used to load the mesh geometry, the point's transform positions the triangles in world space, and the node samples eligible surfaces with area-weighted random placement. The output carries its own `MeshPath` attribute for the grass meshes.
 
