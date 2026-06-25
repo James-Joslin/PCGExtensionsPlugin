@@ -102,8 +102,6 @@ Takes the individual mesh bounds output from both rock graphs (slopes and flat s
 
 The master graph orchestrates these nodes across subgraphs:
 
-![Master graph](Resources/Screenshots/master_graph.png)
-
 ```
 Get Landscape Data
     ├── PCG Rocks Slopes ──────────────┐
