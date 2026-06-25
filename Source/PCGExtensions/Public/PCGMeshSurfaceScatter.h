@@ -1,8 +1,9 @@
 ﻿// PCGMeshSurfaceScatter.h
 // Custom PCG node that samples static mesh surfaces (e.g. rocks) and places
 // grass / foliage only on flat, wide, non-edge regions. Handles partially
-// submerged rocks by tracing to the landscape and rejecting sample points whose
-// mesh surface sits below terrain.
+// submerged rocks by either rejecting sample points below terrain or projecting
+// them onto the landscape surface (filling the gap that ground-cover exclusion
+// zones create around rock footprints).
 //
 // Key surface-quality filters:
 //   • Normal dot-up:        only near-horizontal faces
@@ -33,7 +34,7 @@
 // ─────────────────────────────────────────────
 
 USTRUCT(BlueprintType)
-struct FPCGSurfGrassMeshEntry
+struct PCGEXTENSIONS_API FPCGSurfGrassMeshEntry
 {
 	GENERATED_BODY()
 
@@ -75,8 +76,9 @@ public:
 		return NSLOCTEXT("PCGMeshSurfaceScatter", "Tooltip",
 			"Samples rock/mesh surfaces and places grass/foliage only on flat, wide, "
 			"non-edge areas. Filters by surface normal, edge distance (rejects narrow "
-			"ridges, tips, and mesh perimeter), and curvature. Handles partially "
-			"submerged rocks by rejecting samples below the landscape.");
+			"ridges, tips, and mesh perimeter), and curvature. Submerged samples can "
+			"be projected onto the landscape surface to fill gaps left by ground-cover "
+			"exclusion zones around rock footprints.");
 	}
 	virtual EPCGSettingsType GetType() const override { return EPCGSettingsType::PointOps; }
 #endif
@@ -177,6 +179,24 @@ public:
 		meta = (EditCondition = "bRejectSubmerged", ClampMin = "-50.0", ClampMax = "200.0"))
 	float MinHeightAboveLandscape = 5.0f;
 
+	/**
+	 * Instead of discarding submerged samples, project them up to the landscape
+	 * surface. This fills the grass gap where ground-cover exclusion zones remove
+	 * landscape grass inside rock footprints — the projected points cover the
+	 * terrain directly above the buried rock geometry.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landscape",
+		meta = (EditCondition = "bRejectSubmerged"))
+	bool bProjectSubmergedToLandscape = true;
+
+	/**
+	 * Z offset for landscape-projected grass (UU above the terrain hit).
+	 * Small positive values prevent z-fighting with the landscape surface.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landscape",
+		meta = (EditCondition = "bRejectSubmerged", ClampMin = "-20.0", ClampMax = "50.0"))
+	float LandscapeProjectionZOffset = 2.0f;
+
 	// ── Noise (density variation across the mesh surface) ─────────
 
 	/** Enable Perlin-noise density modulation on the mesh surface. */
@@ -207,6 +227,39 @@ public:
 	/** Attribute the chosen grass mesh path is written to. Feed a By-Attribute Static Mesh Spawner. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grass Mesh")
 	FName OutputMeshPathAttribute = FName(TEXT("MeshPath"));
+
+	// ── Landscape Grass (projected-point overrides) ───────────────
+
+	/**
+	 * Separate grass/foliage mesh set for points projected onto the landscape
+	 * above submerged rock surfaces. Use this to place different vegetation
+	 * where rocks meet the soil — e.g. taller wild grass building up around
+	 * rock bases vs. short moss on exposed rock faces.
+	 *
+	 * If empty, the main GrassMeshSet is used for both rock and landscape points.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landscape Grass",
+		meta = (EditCondition = "bRejectSubmerged && bProjectSubmergedToLandscape",
+			TitleProperty = "Mesh"))
+	TArray<FPCGSurfGrassMeshEntry> LandscapeGrassMeshSet;
+
+	/**
+	 * Layer-level scale range for landscape-projected grass, applied on top of
+	 * each LandscapeGrassMeshSet entry's per-mesh ScaleRange. Separate from the
+	 * rock-surface TierScaleRange so base-of-rock vegetation can be a different
+	 * size than rock-top vegetation.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landscape Grass",
+		meta = (EditCondition = "bRejectSubmerged && bProjectSubmergedToLandscape"))
+	FVector2D LandscapeTierScaleRange = FVector2D(0.8f, 1.2f);
+
+	/**
+	 * Z offset for landscape-projected grass instances (separate from rock-surface
+	 * ZOffset). 0 = flush with terrain. Negative sinks into soil.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Landscape Grass",
+		meta = (EditCondition = "bRejectSubmerged && bProjectSubmergedToLandscape"))
+	float LandscapeGrassZOffset = 0.0f;
 
 	// ── Transform ─────────────────────────────────────────────────
 

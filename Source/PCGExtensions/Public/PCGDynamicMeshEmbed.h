@@ -2,7 +2,8 @@
 // Custom PCG node that dynamically computes embed distance per-point based on
 // assigned mesh bounding box projected onto the surface normal.
 // 
-// Place in your project's Source/PCGExtensions/Public/ directory.
+// Place in your project's Source/<Module>/Public/ directory.
+// Add "PCG" to your Build.cs PublicDependencyModuleNames if not already there.
 
 #pragma once
 
@@ -122,7 +123,7 @@ public:
 //  Element (executes the node logic)
 // ─────────────────────────────────
 
-class FPCGDynamicMeshEmbedElement : public IPCGElement
+class PCGEXTENSIONS_API FPCGDynamicMeshEmbedElement : public IPCGElement
 {
 protected:
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;
@@ -131,6 +132,13 @@ private:
 	/**
 	 * Computes the support function: the maximum extent of the bounding box
 	 * from the origin (pivot) in the given direction.
+	 *
+	 * For direction D and AABB [Min, Max]:
+	 *   support(D) = D.X * (D.X > 0 ? Max.X : Min.X)
+	 *              + D.Y * (D.Y > 0 ? Max.Y : Min.Y)
+	 *              + D.Z * (D.Z > 0 ? Max.Z : Min.Z)
+	 *
+	 * This naturally handles asymmetric bounds (e.g. pivot at base where Min.Z ≈ 0).
 	 */
 	static float ComputeSupportFunction(const FVector& Direction,
 		const FVector& BoundsMin,

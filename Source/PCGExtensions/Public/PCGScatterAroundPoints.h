@@ -7,7 +7,7 @@
 // Distance → Density Remap → Density Filter → Project Points →
 // Normal To Density → Density Filter → Transform Points
 //
-// Place in your project's Source/PCGExtensions/Public/ directory.
+// Place in your project's Source/<Module>/Public/ directory.
 
 #pragma once
 
@@ -75,15 +75,18 @@ public:
 	// ── Scatter Distribution ──
 
 	/** Number of child points to attempt per parent point. Not all will survive filtering. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter", meta = (ClampMin = "1", ClampMax = "200"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter",
+		meta = (ClampMin = "1", ClampMax = "200"))
 	int32 PointsPerParent = 12;
 
 	/** Minimum scatter radius from parent (UU). Points won't be placed closer than this. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter", meta = (ClampMin = "0.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter",
+		meta = (ClampMin = "0.0"))
 	float InnerRadius = 100.0f;
 
 	/** Maximum scatter radius from parent (UU). Points won't be placed further than this. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter", meta = (ClampMin = "10.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scatter",
+		meta = (ClampMin = "10.0"))
 	float OuterRadius = 800.0f;
 
 	// ── Density Falloff ──
@@ -95,13 +98,15 @@ public:
 	 * 0.5 = square root falloff (more uniform distribution)
 	 * 3.0+ = very aggressive falloff (tight clusters)
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Density", meta = (ClampMin = "0.1", ClampMax = "5.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Density",
+		meta = (ClampMin = "0.1", ClampMax = "5.0"))
 	float FalloffExponent = 2.0f;
 
 	// ── Landscape Projection ──
 
 	/** How far downward to trace when projecting scattered points onto the landscape. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Projection", meta = (ClampMin = "500.0", ClampMax = "50000.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Projection",
+		meta = (ClampMin = "500.0", ClampMax = "50000.0"))
 	float TraceDistance = 10000.0f;
 
 	/** Collision channel for the landscape projection trace. */
@@ -112,7 +117,8 @@ public:
 	 * Height above the parent point to start the trace from.
 	 * Should be enough to clear any terrain above the scatter area.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Projection", meta = (ClampMin = "100.0", ClampMax = "10000.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Projection",
+		meta = (ClampMin = "100.0", ClampMax = "10000.0"))
 	float TraceStartHeight = 2000.0f;
 
 	// ── Slope Filtering ──
@@ -120,14 +126,20 @@ public:
 	/**
 	 * Minimum slope steepness to keep (dot product of surface normal with world-up).
 	 * 0.0 = vertical cliff, 1.0 = flat ground.
+	 * Set to 0.0 to keep points on all slopes.
+	 * Set to 0.3 to exclude near-vertical surfaces.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope Filter", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope Filter",
+		meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float MinSlopeDot = 0.0f;
 
 	/**
 	 * Maximum slope steepness to keep.
+	 * Set to 1.0 to keep everything including flat ground.
+	 * Set to 0.85 to exclude flat ground (medium rocks only on slopes).
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope Filter", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope Filter",
+		meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float MaxSlopeDot = 1.0f;
 
 	// ── Self-Pruning ──
@@ -137,7 +149,8 @@ public:
 	 * Points too close to an already-placed point are removed.
 	 * 0 = no pruning.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pruning", meta = (ClampMin = "0.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pruning",
+		meta = (ClampMin = "0.0"))
 	float MinDistanceBetweenPoints = 80.0f;
 
 	// ── Rotation ──
@@ -167,10 +180,12 @@ public:
 	// ── Vertical Offset ──
 
 	/** Additional Z offset after projection (negative = sink into ground). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Offset", meta = (ClampMin = "-5000.0", ClampMax = "5000.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Offset",
+		meta = (ClampMin = "-5000.0", ClampMax = "5000.0"))
 	float VerticalOffsetMin = -200.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Offset", meta = (ClampMin = "-5000.0", ClampMax = "5000.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Offset",
+		meta = (ClampMin = "-5000.0", ClampMax = "5000.0"))
 	float VerticalOffsetMax = -400.0f;
 };
 
@@ -178,7 +193,7 @@ public:
 //  Element
 // ─────────────────────────────────────────────
 
-class FPCGScatterAroundPointsElement : public IPCGElement
+class PCGEXTENSIONS_API FPCGScatterAroundPointsElement : public IPCGElement
 {
 protected:
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;

@@ -4,7 +4,7 @@
 // points that landed on flat ground — identifying cliff crest positions
 // for cap rock placement.
 //
-// Place in your project's Source/PCGExtensions/Public/ directory.
+// Place in your project's Source/<Module>/Public/ directory.
 
 #pragma once
 
@@ -54,6 +54,8 @@ public:
 	/**
 	 * How far upward (world Z) to push each point before projecting back down.
 	 * Controls how far onto the flat ground the cap rocks extend from the cliff edge.
+	 * Too small = cap doesn't cover the hollow undersides of slope rocks below.
+	 * Too large = cap rocks appear on open flat ground far from any cliff.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Detection",
 		meta = (ClampMin = "50.0", ClampMax = "5000.0"))
@@ -62,6 +64,9 @@ public:
 	/**
 	 * Minimum dot product of the projected surface normal with world-up (0,0,1)
 	 * for a point to be considered "flat ground".
+	 * 0.85 ≈ slopes gentler than ~32°.
+	 * 0.90 ≈ slopes gentler than ~26°.
+	 * 0.95 ≈ nearly flat.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Detection",
 		meta = (ClampMin = "0.5", ClampMax = "1.0"))
@@ -69,6 +74,7 @@ public:
 
 	/**
 	 * How far downward to trace when projecting pushed points onto the landscape.
+	 * Should be larger than the tallest cliff in your level.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Detection",
 		meta = (ClampMin = "500.0", ClampMax = "50000.0"))
@@ -76,12 +82,17 @@ public:
 
 	/**
 	 * Collision channel to use for the line trace.
+	 * Default ECC_WorldStatic hits landscapes and static meshes.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Detection")
 	TEnumAsByte<ECollisionChannel> TraceChannel = ECC_WorldStatic;
 
 	/**
 	 * Optional horizontal offset to push points away from the cliff edge.
+	 * Applied in the opposite direction of the original surface normal's horizontal
+	 * component (i.e. pushing the point further onto the flat, away from the slope).
+	 * 0 = no horizontal push (point stays directly above the slope rock).
+	 * 200 = point is nudged 200 UU away from the cliff edge onto the flat.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Detection",
 		meta = (ClampMin = "-2000.0", ClampMax = "2000.0"))
@@ -92,9 +103,7 @@ public:
 //  Element
 // ─────────────────────────────────────────────
 
-// Note: FPCGElement classes generally do not require module export macros unless 
-// you intend to inherit from them or instantiate them directly outside of this plugin.
-class FPCGCrestCapDetectorElement : public IPCGElement
+class PCGEXTENSIONS_API FPCGCrestCapDetectorElement : public IPCGElement
 {
 protected:
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;

@@ -527,6 +527,12 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 		return true;
 	}
 
+	// ── Landscape grass cache (optional, falls back to main cache if empty) ──
+	TArray<FGrassMeshCache> LandscapeGrassCache;
+	float LandscapeGrassTotalWeight = 0.0f;
+	const bool bHasLandscapeGrass = BuildGrassMeshCache(
+		Settings->LandscapeGrassMeshSet, LandscapeGrassCache, LandscapeGrassTotalWeight);
+
 	// ── Collect rock mesh inputs ──
 	// Each entry: mesh ptr + world transform (from the rock point).
 	struct FRockInput
@@ -646,7 +652,7 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 	const int32 BaseSeed = Settings->GetSeed(Context->ExecutionSource.Get());
 
 	// ── Process each rock mesh ──
-	int32 TotalSampled = 0, TotalAccepted = 0, TotalSubmerged = 0;
+	int32 TotalSampled = 0, TotalAccepted = 0, TotalSubmerged = 0, TotalProjected = 0;
 
 	for (int32 RockIdx = 0; RockIdx < RockInputs.Num(); ++RockIdx)
 	{
@@ -693,7 +699,7 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 		const int32 RockSeed = PCGHelpers::ComputeSeed(BaseSeed, Rock.Seed + RockIdx);
 		FRandomStream Rng(RockSeed);
 
-		int32 RockAccepted = 0, RockSubmerged = 0;
+		int32 RockAccepted = 0, RockSubmerged = 0, RockProjected = 0;
 
 		for (int32 SampleIdx = 0; SampleIdx < TargetCount; ++SampleIdx)
 		{
@@ -712,13 +718,13 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 
 			// 4b. Random point within the triangle (uniform barycentric).
 			const FVector Bary = RandomBarycentric(Rng);
-			const FVector SamplePos = Tri.V0 * Bary.X + Tri.V1 * Bary.Y + Tri.V2 * Bary.Z;
-			const FVector SampleNormal = Tri.Normal;
+			FVector SamplePos = Tri.V0 * Bary.X + Tri.V1 * Bary.Y + Tri.V2 * Bary.Z;
+			FVector SampleNormal = Tri.Normal;
+			bool bProjectedToLandscape = false;
 
-			// 5. Submerged rejection — multi-trace to landscape, reject if below terrain.
-			//    Walk all hits and find the one belonging to an ALandscapeProxy actor.
-			//    This avoids the rock's own ISM collision entirely — no Z-proximity
-			//    guessing needed.
+			// 5. Submerged handling — multi-trace to landscape. Points below terrain
+			//    are either projected onto the landscape surface (filling the gap that
+			//    ground-cover exclusion zones create) or rejected outright.
 			if (Settings->bRejectSubmerged)
 			{
 				const FVector TraceStart(SamplePos.X, SamplePos.Y,
@@ -729,32 +735,48 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 				World->LineTraceMultiByChannel(Hits, TraceStart, TraceEnd,
 					Settings->LandscapeTraceChannel, TraceParams);
 
-				// Find the landscape hit by actor type.
+				// Find the landscape hit by actor type — capture both Z and normal.
 				float LandscapeZ = -BIG_NUMBER;
+				FVector LandscapeNormal = WorldUp;
 				for (const FHitResult& H : Hits)
 				{
 					AActor* HitActor = H.GetActor();
 					if (HitActor && HitActor->IsA<ALandscapeProxy>())
 					{
 						LandscapeZ = H.ImpactPoint.Z;
+						LandscapeNormal = H.ImpactNormal;
 						break;
 					}
 				}
 
 				if (LandscapeZ > -BIG_NUMBER + 1.0f)
 				{
-					// Landscape found. Reject if sample sits at or below terrain.
+					// Landscape found. Check if sample sits at or below terrain.
 					if (SamplePos.Z < LandscapeZ + Settings->MinHeightAboveLandscape)
 					{
 						++RockSubmerged;
-						if (RejPoints)
+
+						if (Settings->bProjectSubmergedToLandscape)
 						{
-							FPCGPoint Rej;
-							Rej.Transform.SetLocation(SamplePos);
-							Rej.Density = 0.0f;
-							RejPoints->Add(Rej);
+							// Project to landscape: keep XY, snap Z to terrain,
+							// use landscape normal for grass alignment.
+							SamplePos.Z = LandscapeZ + Settings->LandscapeProjectionZOffset;
+							SampleNormal = LandscapeNormal;
+							bProjectedToLandscape = true;
+							++RockProjected;
+							// Fall through to noise → spacing → output.
 						}
-						continue;
+						else
+						{
+							if (RejPoints)
+							{
+								FPCGPoint Rej;
+								Rej.Transform.SetLocation(SamplePos);
+								Rej.Density = 0.0f;
+								RejPoints->Add(Rej);
+							}
+							continue;
+						}
 					}
 				}
 				// No landscape found below → treat as fully exposed (floating rock, etc.).
@@ -798,10 +820,21 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 			const int32 PointSeed = PCGHelpers::ComputeSeed(RockSeed, SampleIdx);
 			FRandomStream PointRng(PointSeed);
 
-			const int32 GrassIdx = SelectGrassMeshIndex(GrassCache, GrassTotalWeight, PointRng);
-			const FGrassMeshCache& Chosen = GrassCache[GrassIdx];
+			// Select grass mesh from the appropriate cache: landscape-projected
+			// points use the landscape set (if populated), otherwise fall back.
+			const bool bUseLandscapeCache = bProjectedToLandscape && bHasLandscapeGrass;
+			const TArray<FGrassMeshCache>& ActiveCache = bUseLandscapeCache
+				? LandscapeGrassCache : GrassCache;
+			const float ActiveTotalWeight = bUseLandscapeCache
+				? LandscapeGrassTotalWeight : GrassTotalWeight;
 
-			const float TierScale = PointRng.FRandRange(Settings->TierScaleRange.X, Settings->TierScaleRange.Y);
+			const int32 GrassIdx = SelectGrassMeshIndex(ActiveCache, ActiveTotalWeight, PointRng);
+			const FGrassMeshCache& Chosen = ActiveCache[GrassIdx];
+
+			// Scale: landscape-projected points use LandscapeTierScaleRange.
+			const FVector2D& ActiveTierScale = bProjectedToLandscape
+				? Settings->LandscapeTierScaleRange : Settings->TierScaleRange;
+			const float TierScale = PointRng.FRandRange(ActiveTierScale.X, ActiveTierScale.Y);
 			const float MeshScale = PointRng.FRandRange(Chosen.ScaleRange.X, Chosen.ScaleRange.Y);
 			const float FinalScale = TierScale * MeshScale;
 
@@ -811,7 +844,10 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 			const FQuat Rot = MakeSurfaceRotation(SampleNormal, YawDeg,
 				Settings->SlopeAlignAmount, Settings->MaxAlignAngleDeg, JitterP, JitterR);
 
-			const FVector FinalPos = SamplePos + SampleNormal * Settings->ZOffset;
+			// Z offset: landscape-projected points use LandscapeGrassZOffset.
+			const float ActiveZOffset = bProjectedToLandscape
+				? Settings->LandscapeGrassZOffset : Settings->ZOffset;
+			const FVector FinalPos = SamplePos + SampleNormal * ActiveZOffset;
 
 			FPCGPoint NewPoint;
 			NewPoint.Seed = PointSeed;
@@ -838,17 +874,18 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 		TotalSampled += TargetCount;
 		TotalAccepted += RockAccepted;
 		TotalSubmerged += RockSubmerged;
+		TotalProjected += RockProjected;
 
 #if WITH_EDITOR
 		if (Settings->bLogStats)
 		{
 			UE_LOG(LogTemp, Log,
 				TEXT("[MeshSurfaceScatter] Rock %d: mesh=%s  tris=%d  eligible=%d  "
-					"area=%.1f sqm  target=%d  accepted=%d  submerged=%d"),
+					"area=%.1f sqm  target=%d  accepted=%d  submerged=%d  projected=%d"),
 				RockIdx, *Rock.Mesh->GetName(),
 				Tris.Num(), EligibleTris.Num(),
 				TotalEligibleArea * SqCmToSqM, TargetCount,
-				RockAccepted, RockSubmerged);
+				RockAccepted, RockSubmerged, RockProjected);
 		}
 #endif
 	}
@@ -857,8 +894,8 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 	if (Settings->bLogStats)
 	{
 		UE_LOG(LogTemp, Log,
-			TEXT("[MeshSurfaceScatter] TOTAL: rocks=%d  sampled=%d  accepted=%d  submerged=%d"),
-			RockInputs.Num(), TotalSampled, TotalAccepted, TotalSubmerged);
+			TEXT("[MeshSurfaceScatter] TOTAL: rocks=%d  sampled=%d  accepted=%d  submerged=%d  projected=%d"),
+			RockInputs.Num(), TotalSampled, TotalAccepted, TotalSubmerged, TotalProjected);
 	}
 #endif
 

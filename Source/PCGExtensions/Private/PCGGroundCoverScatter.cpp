@@ -185,7 +185,7 @@ bool FPCGGroundCoverScatterElement::BuildMeshCache(
 
 	for (const FPCGGroundMeshEntry& Entry : Entries)
 	{
-		UStaticMesh* LoadedMesh = Entry.Mesh.LoadSynchronous();
+		UStaticMesh* LoadedMesh = Entry.Mesh.Get();
 		if (!LoadedMesh)
 		{
 			continue;

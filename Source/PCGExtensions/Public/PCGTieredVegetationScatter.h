@@ -14,7 +14,7 @@
 // Replaces the chain: Surface Sampler → Normal To Density → Density Filter →
 // Density Noise → Self Pruning → (manual exclusion) → Transform Points.
 //
-// Place in your project's Source/PCGExtensions/Public/ directory.
+// Place in your project's Source/<Module>/Public/ directory.
 // Requires "PCG" in Build.cs PublicDependencyModuleNames.
 
 #pragma once
@@ -129,12 +129,20 @@ protected:
 public:
 	// ── Distribution ──────────────────────────────────────────────
 
-	/** Baseline probability a candidate survives, before noise/biome/exclusion thinning. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Distribution", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	/**
+	 * Baseline probability a candidate survives, before noise/biome/exclusion thinning.
+	 * 1.0 = keep all that pass the filters. Lower to globally thin a dense candidate set.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Distribution",
+		meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float KeepProbability = 1.0f;
 
-	/** Minimum spacing between accepted instances (UU). Trees 400–600, shrubs 100–200. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Distribution", meta = (ClampMin = "0.0"))
+	/**
+	 * Minimum spacing between accepted instances (UU). Poisson-like decimation of the
+	 * candidate set. Trees 400–600, shrubs 100–200. 0 = no pruning (rely on upstream spacing).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Distribution",
+		meta = (ClampMin = "0.0"))
 	float MinDistance = 500.0f;
 
 	// ── Noise Cluster Mask (single Perlin layer) ──────────────────
@@ -144,37 +152,45 @@ public:
 	bool bUseNoiseMask = true;
 
 	/** Cluster pattern scale. Lower = larger clumps / clearings. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise", meta = (EditCondition = "bUseNoiseMask", ClampMin = "0.0001", ClampMax = "1.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise",
+		meta = (EditCondition = "bUseNoiseMask", ClampMin = "0.0001", ClampMax = "1.0"))
 	float NoiseFrequency = 0.004f;
 
 	/** Below this noise value (0–1) no instance spawns — carves hard clearings / cluster edges. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise", meta = (EditCondition = "bUseNoiseMask", ClampMin = "0.0", ClampMax = "1.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise",
+		meta = (EditCondition = "bUseNoiseMask", ClampMin = "0.0", ClampMax = "1.0"))
 	float NoiseThreshold = 0.3f;
 
 	/** Spawn in the low-noise regions (clearings) instead of the clumps. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise", meta = (EditCondition = "bUseNoiseMask"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise",
+		meta = (EditCondition = "bUseNoiseMask"))
 	bool bInvertNoise = false;
 
 	/** Noise seed. Share across tiers so undergrowth aligns with canopy clusters. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise", meta = (EditCondition = "bUseNoiseMask"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise",
+		meta = (EditCondition = "bUseNoiseMask"))
 	int32 NoiseSeed = 0;
 
 	// ── Slope & Surface ───────────────────────────────────────────
 
 	/** Min slope dot (surface normal · world-up). Large trees ~0.7, shrubs ~0.4. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope & Surface", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope & Surface",
+		meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float MinSlopeDot = 0.7f;
 
 	/** Max slope dot. 1.0 keeps flat ground. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope & Surface", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope & Surface",
+		meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float MaxSlopeDot = 1.0f;
 
 	/** 0 = always upright (recommended for trees). 1 = fully aligned to the surface normal. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope & Surface", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope & Surface",
+		meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float SlopeAlignAmount = 0.15f;
 
 	/** Clamp on the slope-align lean so meshes never tip past this off vertical. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope & Surface", meta = (ClampMin = "0.0", ClampMax = "89.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slope & Surface",
+		meta = (ClampMin = "0.0", ClampMax = "89.0"))
 	float MaxAlignAngleDeg = 30.0f;
 
 	/** Z offset to sink the base into the surface (negative = sink). */
@@ -183,10 +199,12 @@ public:
 
 	// ── Projection ────────────────────────────────────────────────
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Projection", meta = (ClampMin = "100.0", ClampMax = "20000.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Projection",
+		meta = (ClampMin = "100.0", ClampMax = "20000.0"))
 	float TraceStartHeight = 2000.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Projection", meta = (ClampMin = "500.0", ClampMax = "50000.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Projection",
+		meta = (ClampMin = "500.0", ClampMax = "50000.0"))
 	float TraceDistance = 10000.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Projection")
@@ -195,7 +213,8 @@ public:
 	// ── Biome Response ────────────────────────────────────────────
 
 	/** One entry per biome this tier responds to. Empty = ignore biomes (uniform). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome", meta = (TitleProperty = "BiomeAttribute"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome",
+		meta = (TitleProperty = "BiomeAttribute"))
 	TArray<FPCGVegBiomeResponse> BiomeResponses;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Biome")
@@ -208,10 +227,14 @@ public:
 	// ── Mesh Set ──────────────────────────────────────────────────
 
 	/** Weighted mesh variants for this tier. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh Set", meta = (TitleProperty = "Mesh"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh Set",
+		meta = (TitleProperty = "Mesh"))
 	TArray<FPCGVegMeshEntry> MeshSet;
 
-	/** Attribute the chosen mesh path is written to. */
+	/**
+	 * Attribute the chosen mesh path is written to. Use a By-Attribute Static Mesh
+	 * Spawner downstream. This output can also feed the NEXT tier's Exclusion Sources.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh Set")
 	FName MeshPathAttributeName = FName(TEXT("MeshPath"));
 
@@ -225,34 +248,47 @@ public:
 	bool bRandomYaw = true;
 
 	/** Small random pitch/roll tilt for organic variation (degrees). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Transform", meta = (ClampMin = "0.0", ClampMax = "30.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Transform",
+		meta = (ClampMin = "0.0", ClampMax = "30.0"))
 	float PitchRollJitterDeg = 2.0f;
 
 	// ── Companions / Understory (optional Companions pin) ─────────
 
-	/** Emit a ring of understory points around each accepted instance. */
+	/**
+	 * Emit a ring of understory points around each accepted instance (e.g. shrubs around
+	 * big trees). Output is transform-ready but mesh-less — assign shrub meshes downstream
+	 * with a Spawner, or pipe into Scatter Around Points for richer control. Companions
+	 * inherit slope, exclusion and projection.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions")
 	bool bGenerateCompanions = false;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions", meta = (EditCondition = "bGenerateCompanions", ClampMin = "0", ClampMax = "16"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions",
+		meta = (EditCondition = "bGenerateCompanions", ClampMin = "0", ClampMax = "16"))
 	int32 CompanionsPerPrimaryMin = 2;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions", meta = (EditCondition = "bGenerateCompanions", ClampMin = "0", ClampMax = "16"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions",
+		meta = (EditCondition = "bGenerateCompanions", ClampMin = "0", ClampMax = "16"))
 	int32 CompanionsPerPrimaryMax = 5;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions", meta = (EditCondition = "bGenerateCompanions", ClampMin = "0.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions",
+		meta = (EditCondition = "bGenerateCompanions", ClampMin = "0.0"))
 	float CompanionRadiusMin = 150.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions", meta = (EditCondition = "bGenerateCompanions", ClampMin = "10.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions",
+		meta = (EditCondition = "bGenerateCompanions", ClampMin = "10.0"))
 	float CompanionRadiusMax = 450.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions", meta = (EditCondition = "bGenerateCompanions", ClampMin = "0.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions",
+		meta = (EditCondition = "bGenerateCompanions", ClampMin = "0.0"))
 	float CompanionMinDistance = 80.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions", meta = (EditCondition = "bGenerateCompanions"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions",
+		meta = (EditCondition = "bGenerateCompanions"))
 	FVector2D CompanionScaleRange = FVector2D(0.6f, 1.0f);
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions", meta = (EditCondition = "bGenerateCompanions"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Companions",
+		meta = (EditCondition = "bGenerateCompanions"))
 	float CompanionZOffset = -5.0f;
 
 	// ── Debug ─────────────────────────────────────────────────────
@@ -266,12 +302,13 @@ public:
 //  Element
 // ─────────────────────────────────────────────
 
-class FPCGTieredVegetationScatterElement : public IPCGElement
+class PCGEXTENSIONS_API FPCGTieredVegetationScatterElement : public IPCGElement
 {
 protected:
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;
 
 private:
+	/** Cached, weight-accumulated mesh entry. */
 	struct FVegMeshCache
 	{
 		FSoftObjectPath MeshPath;
@@ -279,11 +316,28 @@ private:
 		float CumulativeWeight = 0.0f;
 	};
 
-	static bool BuildMeshCache(const TArray<FPCGVegMeshEntry>& Entries, TArray<FVegMeshCache>& OutCache, float& OutTotalWeight);
+	/** Load meshes, accumulate weights. Returns false if none valid. */
+	static bool BuildMeshCache(const TArray<FPCGVegMeshEntry>& Entries,
+		TArray<FVegMeshCache>& OutCache, float& OutTotalWeight);
+
+	/** Weighted random mesh index. */
 	static int32 SelectMeshIndex(const TArray<FVegMeshCache>& Cache, float TotalWeight, FRandomStream& Rng);
+
+	/** Read a const float attribute value, or Default if absent/wrong type. */
 	static float ReadFloatAttr(const UPCGMetadata* Meta, FName Name, int64 EntryKey, float Default);
+
+	/** Read a const string attribute value, or empty if absent/wrong type. */
 	static FString ReadStringAttr(const UPCGMetadata* Meta, FName Name, int64 EntryKey);
-	static void ComputeBiomeFactors(const TArray<FPCGVegBiomeResponse>& Responses, EPCGVegBiomeCombine Mode, const UPCGMetadata* Meta, int64 EntryKey, float& OutDensity, float& OutScale);
-	static FQuat MakeFoliageRotation(const FVector& SurfaceNormal, float YawDeg, float AlignAmount, float MaxAlignDeg, float JitterPitchDeg, float JitterRollDeg);
+
+	/** Combine the per-biome responses at a point into a density and scale multiplier. */
+	static void ComputeBiomeFactors(const TArray<FPCGVegBiomeResponse>& Responses,
+		EPCGVegBiomeCombine Mode, const UPCGMetadata* Meta, int64 EntryKey,
+		float& OutDensity, float& OutScale);
+
+	/** Build an upright-ish foliage rotation with optional slope lean, yaw and jitter. */
+	static FQuat MakeFoliageRotation(const FVector& SurfaceNormal, float YawDeg,
+		float AlignAmount, float MaxAlignDeg, float JitterPitchDeg, float JitterRollDeg);
+
+	/** Perlin sample remapped to 0–1. */
 	static float Perlin01(const FVector& Position, float Frequency, int32 Seed);
 };

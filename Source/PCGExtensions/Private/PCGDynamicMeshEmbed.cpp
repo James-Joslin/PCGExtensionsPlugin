@@ -53,6 +53,8 @@ FPCGElementPtr UPCGDynamicMeshEmbedSettings::CreateElement() const
 	return MakeShared<FPCGDynamicMeshEmbedElement>();
 }
 
+
+
 // ─────────────────────────────────────────────
 //  Element — Execution
 // ─────────────────────────────────────────────
@@ -118,7 +120,7 @@ bool FPCGDynamicMeshEmbedElement::ExecuteInternal(FPCGContext* Context) const
 
 	for (const FPCGEmbedMeshEntry& Entry : Settings->MeshEntries)
 	{
-		UStaticMesh* LoadedMesh = Entry.Mesh.LoadSynchronous();
+		UStaticMesh* LoadedMesh = Entry.Mesh.Get();
 		if (!LoadedMesh)
 		{
 			PCGE_LOG(Warning, GraphAndLog,

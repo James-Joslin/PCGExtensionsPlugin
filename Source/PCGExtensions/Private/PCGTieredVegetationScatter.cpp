@@ -91,7 +91,7 @@ bool FPCGTieredVegetationScatterElement::BuildMeshCache(
 
 	for (const FPCGVegMeshEntry& Entry : Entries)
 	{
-		UStaticMesh* LoadedMesh = Entry.Mesh.LoadSynchronous();
+		UStaticMesh* LoadedMesh = Entry.Mesh.Get();
 		if (!LoadedMesh)
 		{
 			continue;

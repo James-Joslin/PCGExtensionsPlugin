@@ -474,7 +474,11 @@ bool FPCGRockFormationGeneratorElement::ExecuteInternal(FPCGContext* Context) co
 				Point.Seed = PCGHelpers::ComputeSeed(FormationSeed,
 					OutputPoints.Num());
 				Point.Density = 1.0f;
-				Point.SetExtents(FVector(50.0f));
+				// Write actual mesh local AABB — handles base-pivot offset correctly.
+				// Downstream consumers (GroundCover exclusion, debug vis) read
+				// GetExtents() + GetLocalCenter() to recover the asymmetric box.
+				Point.BoundsMin = Rock.BoundsMin;
+				Point.BoundsMax = Rock.BoundsMax;
 				Point.Steepness = 1.0f;
 
 				// Set mesh path attribute
