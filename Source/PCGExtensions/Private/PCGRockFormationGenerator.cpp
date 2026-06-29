@@ -5,10 +5,11 @@
 #include "PCGRockFormationGenerator.h"
 
 #include "PCGContext.h"
-#include "PCGPoint.h"
-#include "Data/PCGPointData.h"
+#include "Data/PCGBasePointData.h"
 #include "Metadata/PCGMetadata.h"
+#include "Metadata/PCGMetadataAttribute.h"
 #include "Helpers/PCGHelpers.h"
+#include "Async/PCGAsyncLoadingContext.h"
 #include "Engine/StaticMesh.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(PCGRockFormationGenerator)
@@ -48,37 +49,87 @@ FPCGElementPtr UPCGRockFormationGeneratorSettings::CreateElement() const
 }
 
 // ─────────────────────────────────────────────
+//  Element -- Async resource loading
+// ─────────────────────────────────────────────
+
+bool FPCGRockFormationGeneratorElement::PrepareDataInternal(FPCGContext* Context) const
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(FPCGRockFormationGeneratorElement::PrepareData);
+
+	const UPCGRockFormationGeneratorSettings* Settings =
+		Context->GetInputSettings<UPCGRockFormationGeneratorSettings>();
+	check(Settings);
+
+	FPCGRockFormationGeneratorContext* ThisContext =
+		static_cast<FPCGRockFormationGeneratorContext*>(Context);
+
+	if (!ThisContext->WasLoadRequested())
+	{
+		// Collect soft paths across all three mesh sets (Foundation + Tier 1 + Tier 2).
+		TArray<FSoftObjectPath> ToLoad;
+
+		auto CollectPaths = [&ToLoad](const TArray<FPCGFormationMeshEntry>& Entries)
+		{
+			for (const FPCGFormationMeshEntry& Entry : Entries)
+			{
+				if (!Entry.Mesh.IsNull())
+				{
+					ToLoad.Add(Entry.Mesh.ToSoftObjectPath());
+				}
+			}
+		};
+
+		CollectPaths(Settings->FoundationMeshEntries);
+		CollectPaths(Settings->Tier1Config.MeshEntries);
+		CollectPaths(Settings->Tier2Config.MeshEntries);
+
+		// Async load suspends the task (returns false) until streaming completes; on resume
+		// WasLoadRequested() is true so we skip straight to caching below. A synchronous load
+		// returns true immediately and falls through to caching on this same pass. The context
+		// holds the streamable handle so the meshes stay resident through Execute.
+		if (!ThisContext->RequestResourceLoad(ThisContext, MoveTemp(ToLoad), !Settings->bSynchronousLoad))
+		{
+			return false;
+		}
+	}
+
+	// ── Resolve per-tier mesh bounds on the game thread and cache them on the context. ──
+	// BuildMeshBoundsCache reads UStaticMesh::GetBoundingBox(), which is unsafe off the game
+	// thread, so it happens here in the PrepareData phase rather than in ExecuteInternal
+	// (which runs on a worker thread and only reads these caches).
+	if (!ThisContext->bCacheBuilt)
+	{
+		if (!PCGExtScatterCommon::BuildMeshBoundsCache(
+			Settings->FoundationMeshEntries,
+			ThisContext->FoundationCache,
+			ThisContext->FoundationTotalWeight))
+		{
+			PCGE_LOG(Error, GraphAndLog, NSLOCTEXT("PCGRockFormationGenerator", "NoFoundation",
+				"Rock Formation Generator: No valid foundation meshes."));
+			return true;
+		}
+
+		ThisContext->bHasTier1 = PCGExtScatterCommon::BuildMeshBoundsCache(
+			Settings->Tier1Config.MeshEntries,
+			ThisContext->Tier1Cache,
+			ThisContext->Tier1TotalWeight);
+		ThisContext->bHasTier2 = PCGExtScatterCommon::BuildMeshBoundsCache(
+			Settings->Tier2Config.MeshEntries,
+			ThisContext->Tier2Cache,
+			ThisContext->Tier2TotalWeight);
+
+		ThisContext->bCacheBuilt = true;
+	}
+
+	return true;
+}
+
+// ─────────────────────────────────────────────
 //  Element — Helpers
 // ─────────────────────────────────────────────
 
-bool FPCGRockFormationGeneratorElement::CacheTierMeshes(
-	const TArray<FPCGFormationMeshEntry>& Entries,
-	TArray<FFormationMeshCache>& OutCache,
-	float& OutTotalWeight)
-{
-	OutCache.Reset();
-	OutTotalWeight = 0.0f;
-
-	for (const FPCGFormationMeshEntry& Entry : Entries)
-	{
-		UStaticMesh* LoadedMesh = Entry.Mesh.LoadSynchronous();
-		if (!LoadedMesh) continue;
-
-		FFormationMeshCache Cache;
-		Cache.MeshPath = FSoftObjectPath(LoadedMesh);
-		const FBox Bounds = LoadedMesh->GetBoundingBox();
-		Cache.BoundsMin = Bounds.Min;
-		Cache.BoundsMax = Bounds.Max;
-		OutTotalWeight += FMath::Max(Entry.Weight, 0.01f);
-		Cache.CumulativeWeight = OutTotalWeight;
-		OutCache.Add(Cache);
-	}
-
-	return OutCache.Num() > 0;
-}
-
-const FFormationMeshCache& FPCGRockFormationGeneratorElement::SelectRandomMesh(
-	const TArray<FFormationMeshCache>& Cache,
+const PCGExtScatterCommon::FMeshBoundsCache& FPCGRockFormationGeneratorElement::SelectRandomMesh(
+	const TArray<PCGExtScatterCommon::FMeshBoundsCache>& Cache,
 	float TotalWeight,
 	FRandomStream& Rng)
 {
@@ -95,7 +146,7 @@ const FFormationMeshCache& FPCGRockFormationGeneratorElement::SelectRandomMesh(
 
 void FPCGRockFormationGeneratorElement::GenerateTierRocks(
 	const FPCGFormationTierConfig& Config,
-	const TArray<FFormationMeshCache>& MeshCache,
+	const TArray<PCGExtScatterCommon::FMeshBoundsCache>& MeshCache,
 	float MeshTotalWeight,
 	const TArray<FFormationPlacedRock>& ParentRocks,
 	const FVector& FormationCentre,
@@ -121,7 +172,7 @@ void FPCGRockFormationGeneratorElement::GenerateTierRocks(
 
 		for (int32 RockIdx = 0; RockIdx < RockCount; ++RockIdx)
 		{
-			const FFormationMeshCache& SelectedMesh = SelectRandomMesh(MeshCache, MeshTotalWeight, Rng);
+			const PCGExtScatterCommon::FMeshBoundsCache& SelectedMesh = SelectRandomMesh(MeshCache, MeshTotalWeight, Rng);
 
 			// ─ Scale ─
 			const float Scale = Rng.FRandRange(Config.MinScale, Config.MaxScale);
@@ -137,24 +188,14 @@ void FPCGRockFormationGeneratorElement::GenerateTierRocks(
 				Parent.Position.Y + FMath::Sin(Angle) * Radius,
 				HeightZ + Config.VerticalOffset);
 
-			// ─ Rotation: random yaw + inward tilt toward formation centre ─
+			// ─ Rotation: random yaw only ─
+			// TODO(audit): the advertised "inward tilt toward formation centre" (leaning
+			// rock look, driven by Config.MaxInwardTilt) is currently a no-op -- Rock.Rotation
+			// below is only ever the yaw quaternion. The original tilt computation
+			// (TowardCentre / TiltAngle / RockRot / YawQuat / TiltQuat / FinalRot) was dead
+			// code whose result was never stored, so it has been removed to satisfy -Werror.
+			// Reimplementing the lean is a behavioral/visual
 			const float Yaw = Rng.FRandRange(0.0f, 360.0f);
-			const float InwardTilt = Rng.FRandRange(0.0f, Config.MaxInwardTilt);
-
-			// Compute tilt direction: toward formation centre
-			FVector TowardCentre = FormationCentre - RockPos;
-			TowardCentre.Z = 0.0f;
-			const float TiltAngle = (TowardCentre.Size() > KINDA_SMALL_NUMBER)
-				? FMath::Atan2(TowardCentre.Y, TowardCentre.X) * (180.0f / PI)
-				: 0.0f;
-
-			// Build rotation: yaw + tilt toward centre
-			FRotator RockRot(InwardTilt, Yaw, 0.0f);
-			// Apply tilt direction
-			const FQuat YawQuat = FRotator(0.0f, TiltAngle, 0.0f).Quaternion();
-			const FQuat TiltQuat = FRotator(InwardTilt, 0.0f, 0.0f).Quaternion();
-			const FQuat FinalRot = FRotator(0.0f, Yaw, 0.0f).Quaternion() *
-				YawQuat * TiltQuat * YawQuat.Inverse();
 
 			// ─ Store placed rock ─
 			FFormationPlacedRock Rock;
@@ -178,7 +219,7 @@ void FPCGRockFormationGeneratorElement::GenerateFillRocks(
 	float OverhangTolerance,
 	int32 MaxFillsPerRock,
 	float FillScaleMultiplier,
-	const TArray<FFormationMeshCache>& FillMeshCache,
+	const TArray<PCGExtScatterCommon::FMeshBoundsCache>& FillMeshCache,
 	float FillMeshTotalWeight,
 	int32 FillTierIndex,
 	int32 TargetTierIndex,
@@ -236,11 +277,8 @@ void FPCGRockFormationGeneratorElement::GenerateFillRocks(
 			{
 				// Place a fill rock at this gap position
 				// Fill is at the SUPPORT tier level (below the overhanging rock)
-				const FFormationMeshCache& FillMesh = SelectRandomMesh(
+				const PCGExtScatterCommon::FMeshBoundsCache& FillMesh = SelectRandomMesh(
 					FillMeshCache, FillMeshTotalWeight, SampleRng);
-
-				// Determine fill rock height: roughly where the support tier sits
-				float FillZ = BottomZ - FillMesh.BoundsMax.Z * FillScaleMultiplier * 0.5f;
 
 				// Find the nearest support rock to estimate ground level
 				float NearestSupportZ = BottomZ - 200.0f; // Fallback
@@ -286,22 +324,27 @@ bool FPCGRockFormationGeneratorElement::ExecuteInternal(FPCGContext* Context) co
 		Context->GetInputSettings<UPCGRockFormationGeneratorSettings>();
 	check(Settings);
 
-	// ── Cache all tier meshes ──
+	FPCGRockFormationGeneratorContext* ThisContext =
+		static_cast<FPCGRockFormationGeneratorContext*>(Context);
 
-	TArray<FFormationMeshCache> FoundationCache, Tier1Cache, Tier2Cache;
-	float FoundationTotalWeight = 0.0f, Tier1TotalWeight = 0.0f, Tier2TotalWeight = 0.0f;
+	// ── Read tier mesh caches resolved on the game thread during PrepareData ──
+	// GetBoundingBox() already ran in PrepareDataInternal; here we only read the caches.
 
-	if (!CacheTierMeshes(Settings->FoundationMeshEntries, FoundationCache, FoundationTotalWeight))
+	const TArray<PCGExtScatterCommon::FMeshBoundsCache>& FoundationCache = ThisContext->FoundationCache;
+	const TArray<PCGExtScatterCommon::FMeshBoundsCache>& Tier1Cache = ThisContext->Tier1Cache;
+	const TArray<PCGExtScatterCommon::FMeshBoundsCache>& Tier2Cache = ThisContext->Tier2Cache;
+	const float FoundationTotalWeight = ThisContext->FoundationTotalWeight;
+	const float Tier1TotalWeight = ThisContext->Tier1TotalWeight;
+	const float Tier2TotalWeight = ThisContext->Tier2TotalWeight;
+	const bool bHasTier1 = ThisContext->bHasTier1;
+	const bool bHasTier2 = ThisContext->bHasTier2;
+
+	if (FoundationCache.Num() == 0)
 	{
 		PCGE_LOG(Error, GraphAndLog, NSLOCTEXT("PCGRockFormationGenerator", "NoFoundation",
 			"Rock Formation Generator: No valid foundation meshes."));
 		return true;
 	}
-
-	const bool bHasTier1 = CacheTierMeshes(
-		Settings->Tier1Config.MeshEntries, Tier1Cache, Tier1TotalWeight);
-	const bool bHasTier2 = CacheTierMeshes(
-		Settings->Tier2Config.MeshEntries, Tier2Cache, Tier2TotalWeight);
 
 	// ── Process inputs ──
 
@@ -311,41 +354,26 @@ bool FPCGRockFormationGeneratorElement::ExecuteInternal(FPCGContext* Context) co
 
 	for (const FPCGTaggedData& Input : Inputs)
 	{
-		const UPCGPointData* InputPointData = Cast<UPCGPointData>(Input.Data);
+		const UPCGBasePointData* InputPointData = Cast<UPCGBasePointData>(Input.Data);
 		if (!InputPointData) continue;
 
-		const TArray<FPCGPoint>& InputPoints = InputPointData->GetPoints();
-		if (InputPoints.Num() == 0) continue;
+		const int32 NumInputPoints = InputPointData->GetNumPoints();
+		if (NumInputPoints == 0) continue;
 
-		// Create output
-		UPCGPointData* OutputPointData = NewObject<UPCGPointData>();
-		OutputPointData->InitializeFromData(InputPointData);
-		TArray<FPCGPoint>& OutputPoints = OutputPointData->GetMutablePoints();
-		OutputPoints.Reset();
+		const TConstPCGValueRange<FTransform> InputTransforms = InputPointData->GetConstTransformValueRange();
+		const TConstPCGValueRange<int32> InputSeeds = InputPointData->GetConstSeedValueRange();
 
-		// Create metadata attributes
-		UPCGMetadata* Metadata = OutputPointData->MutableMetadata();
-		FPCGMetadataAttribute<FString>* MeshPathAttr =
-			Metadata->FindOrCreateAttribute<FString>(
-				Settings->MeshPathAttributeName, FString(), false, true);
-		FPCGMetadataAttribute<bool>* FillFlagAttr =
-			Metadata->FindOrCreateAttribute<bool>(
-				Settings->FillFlagAttributeName, false, false, true);
-
-		if (!MeshPathAttr || !FillFlagAttr)
-		{
-			PCGE_LOG(Error, GraphAndLog, NSLOCTEXT("PCGRockFormationGenerator", "AttrFail",
-				"Rock Formation Generator: Failed to create output attributes."));
-			continue;
-		}
+		// Accumulate every generated rock for ALL input points first, so the output
+		// point count is known before allocation. Determinism is preserved: each input
+		// point seeds its own FRandomStream exactly as before.
+		TArray<FFormationPlacedRock> OutputRocks;
 
 		// ── For each input point, generate a formation ──
 
-		for (int32 FormationIdx = 0; FormationIdx < InputPoints.Num(); ++FormationIdx)
+		for (int32 FormationIdx = 0; FormationIdx < NumInputPoints; ++FormationIdx)
 		{
-			const FPCGPoint& InputPoint = InputPoints[FormationIdx];
-			const FVector FormationCentre = InputPoint.Transform.GetLocation();
-			const int32 FormationSeed = PCGHelpers::ComputeSeed(BaseSeed, InputPoint.Seed + FormationIdx);
+			const FVector FormationCentre = InputTransforms[FormationIdx].GetLocation();
+			const int32 FormationSeed = PCGHelpers::ComputeSeed(BaseSeed, InputSeeds[FormationIdx] + FormationIdx);
 			FRandomStream FormationRng(FormationSeed);
 
 			// All placed rocks for this formation (for overhang detection)
@@ -361,7 +389,7 @@ bool FPCGRockFormationGeneratorElement::ExecuteInternal(FPCGContext* Context) co
 
 			for (int32 FIdx = 0; FIdx < FoundationCount; ++FIdx)
 			{
-				const FFormationMeshCache& Mesh = SelectRandomMesh(
+				const PCGExtScatterCommon::FMeshBoundsCache& Mesh = SelectRandomMesh(
 					FoundationCache, FoundationTotalWeight, FormationRng);
 
 				const float Scale = FormationRng.FRandRange(
@@ -465,36 +493,82 @@ bool FPCGRockFormationGeneratorElement::ExecuteInternal(FPCGContext* Context) co
 
 			FormationRocks.Append(FillRocks);
 
-			// ── Phase 5: Convert to PCG Points ──
-
-			for (const FFormationPlacedRock& Rock : FormationRocks)
+			// ── Phase 5: Accumulate rocks (seed resolved against the running output count) ──
+			// Seed derivation is identical to the legacy path: ComputeSeed(FormationSeed,
+			// <running output index>). Accumulating in the same order keeps determinism.
+			for (FFormationPlacedRock& Rock : FormationRocks)
 			{
-				FPCGPoint Point;
-				Point.Transform = FTransform(Rock.Rotation, Rock.Position, Rock.Scale);
-				Point.Seed = PCGHelpers::ComputeSeed(FormationSeed,
-					OutputPoints.Num());
-				Point.Density = 1.0f;
-				// Write actual mesh local AABB — handles base-pivot offset correctly.
-				// Downstream consumers (GroundCover exclusion, debug vis) read
-				// GetExtents() + GetLocalCenter() to recover the asymmetric box.
-				Point.BoundsMin = Rock.BoundsMin;
-				Point.BoundsMax = Rock.BoundsMax;
-				Point.Steepness = 1.0f;
-
-				// Set mesh path attribute
-				Metadata->InitializeOnSet(Point.MetadataEntry);
-				MeshPathAttr->SetValue(Point.MetadataEntry, Rock.MeshPath.ToString());
-				FillFlagAttr->SetValue(Point.MetadataEntry, Rock.bIsFillRock);
-
-				OutputPoints.Add(Point);
+				Rock.Seed = PCGHelpers::ComputeSeed(FormationSeed, OutputRocks.Num());
+				OutputRocks.Add(Rock);
 			}
 		}
 
-		if (OutputPoints.Num() > 0)
+		if (OutputRocks.Num() == 0) continue;
+
+		// ── Build the output point data (generate pattern) ──
+
+		const int32 TotalRockCount = OutputRocks.Num();
+
+		UPCGBasePointData* OutputPointData = FPCGContext::NewPointData_AnyThread(Context);
+		OutputPointData->InitializeFromData(InputPointData);
+		OutputPointData->SetNumPoints(TotalRockCount, /*bInitializeValues=*/false);
+		OutputPointData->AllocateProperties(
+			EPCGPointNativeProperties::Transform |
+			EPCGPointNativeProperties::Seed |
+			EPCGPointNativeProperties::Density |
+			EPCGPointNativeProperties::Steepness |
+			EPCGPointNativeProperties::BoundsMin |
+			EPCGPointNativeProperties::BoundsMax |
+			EPCGPointNativeProperties::MetadataEntry);
+
+		// Create metadata attributes. MeshPath is a SoftObjectPath so the Static Mesh
+		// Spawner "By Attribute" selector consumes it natively; keep the bool fill flag.
+		UPCGMetadata* Metadata = OutputPointData->MutableMetadata();
+		Metadata->CreateSoftObjectPathAttribute(
+			Settings->MeshPathAttributeName, FSoftObjectPath(), /*bAllowsInterpolation=*/false);
+		FPCGMetadataAttribute<FSoftObjectPath>* MeshPathAttr =
+			Metadata->GetMutableTypedAttribute<FSoftObjectPath>(Settings->MeshPathAttributeName);
+		FPCGMetadataAttribute<bool>* FillFlagAttr =
+			Metadata->FindOrCreateAttribute<bool>(
+				Settings->FillFlagAttributeName, false, false, true);
+
+		if (!MeshPathAttr || !FillFlagAttr)
 		{
-			FPCGTaggedData& Output = Outputs.Add_GetRef(Input);
-			Output.Data = OutputPointData;
+			PCGE_LOG(Error, GraphAndLog, NSLOCTEXT("PCGRockFormationGenerator", "AttrFail",
+				"Rock Formation Generator: Failed to create output attributes."));
+			continue;
 		}
+
+		TPCGValueRange<FTransform> TransformRange = OutputPointData->GetTransformValueRange();
+		TPCGValueRange<int32> SeedRange = OutputPointData->GetSeedValueRange();
+		TPCGValueRange<float> DensityRange = OutputPointData->GetDensityValueRange();
+		TPCGValueRange<float> SteepnessRange = OutputPointData->GetSteepnessValueRange();
+		TPCGValueRange<FVector> BoundsMinRange = OutputPointData->GetBoundsMinValueRange();
+		TPCGValueRange<FVector> BoundsMaxRange = OutputPointData->GetBoundsMaxValueRange();
+		TPCGValueRange<int64> MetadataEntryRange = OutputPointData->GetMetadataEntryValueRange();
+
+		for (int32 i = 0; i < TotalRockCount; ++i)
+		{
+			const FFormationPlacedRock& Rock = OutputRocks[i];
+
+			TransformRange[i] = FTransform(Rock.Rotation, Rock.Position, Rock.Scale);
+			SeedRange[i] = Rock.Seed;
+			DensityRange[i] = 1.0f;
+			SteepnessRange[i] = 1.0f;
+			// Write actual mesh local AABB -- handles base-pivot offset correctly (asymmetric).
+			// Downstream consumers (GroundCover exclusion, debug vis) read the asymmetric box.
+			BoundsMinRange[i] = Rock.BoundsMin;
+			BoundsMaxRange[i] = Rock.BoundsMax;
+
+			// Store mesh path + fill flag via the metadata-entry range.
+			MetadataEntryRange[i] = PCGInvalidEntryKey;
+			Metadata->InitializeOnSet(MetadataEntryRange[i]);
+			MeshPathAttr->SetValue(MetadataEntryRange[i], Rock.MeshPath);
+			FillFlagAttr->SetValue(MetadataEntryRange[i], Rock.bIsFillRock);
+		}
+
+		FPCGTaggedData& Output = Outputs.Add_GetRef(Input);
+		Output.Data = OutputPointData;
 	}
 
 	return true;

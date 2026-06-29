@@ -22,6 +22,7 @@
 #include "CoreMinimal.h"
 #include "PCGSettings.h"
 #include "PCGElement.h"
+#include "PCGContext.h"
 #include "Engine/StaticMesh.h"
 
 #include "PCGTieredVegetationScatter.generated.h"
@@ -92,6 +93,11 @@ struct PCGEXTENSIONS_API FPCGVegBiomeResponse
 //  Settings
 // ─────────────────────────────────────────────
 
+// TODO(audit): The class summary above and the node tooltip below both advertise
+// "mesh-bounds obstacle exclusion" (avoids rock faces / larger tiers). That feature
+// does not exist -- the only implementation was a commented-out stub in the .cpp,
+// which has been removed. Owner must either implement the exclusion feature or strip
+// the claims from the summary, the node tooltip, and the Out-pin tooltip.
 UCLASS(BlueprintType, ClassGroup = (Procedural))
 class PCGEXTENSIONS_API UPCGTieredVegetationScatterSettings : public UPCGSettings
 {
@@ -302,9 +308,11 @@ public:
 //  Element
 // ─────────────────────────────────────────────
 
-class PCGEXTENSIONS_API FPCGTieredVegetationScatterElement : public IPCGElement
+class PCGEXTENSIONS_API FPCGTieredVegetationScatterElement
+	: public IPCGElement
 {
 protected:
+	virtual bool SupportsBasePointDataInputs(FPCGContext* InContext) const override { return true; }
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;
 
 private:
@@ -325,9 +333,6 @@ private:
 
 	/** Read a const float attribute value, or Default if absent/wrong type. */
 	static float ReadFloatAttr(const UPCGMetadata* Meta, FName Name, int64 EntryKey, float Default);
-
-	/** Read a const string attribute value, or empty if absent/wrong type. */
-	static FString ReadStringAttr(const UPCGMetadata* Meta, FName Name, int64 EntryKey);
 
 	/** Combine the per-biome responses at a point into a density and scale multiplier. */
 	static void ComputeBiomeFactors(const TArray<FPCGVegBiomeResponse>& Responses,

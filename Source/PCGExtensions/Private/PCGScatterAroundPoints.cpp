@@ -5,11 +5,12 @@
 #include "PCGScatterAroundPoints.h"
 
 #include "PCGContext.h"
-#include "PCGPoint.h"
-#include "Data/PCGPointData.h"
+#include "Data/PCGBasePointData.h"
 #include "Helpers/PCGHelpers.h"
 #include "Engine/World.h"
 #include "CollisionQueryParams.h"
+
+#include "PCGExtScatterCommon.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(PCGScatterAroundPoints)
 
@@ -92,43 +93,48 @@ bool FPCGScatterAroundPointsElement::ExecuteInternal(FPCGContext* Context) const
 	QueryParams.bTraceComplex = false;
 	QueryParams.bReturnPhysicalMaterial = false;
 
-	const FVector WorldUp(0.0, 0.0, 1.0);
 	const int32 BaseSeed = Settings->GetSeed(Context->ExecutionSource.Get());
 
 	for (const FPCGTaggedData& Input : Inputs)
 	{
-		const UPCGPointData* InputPointData = Cast<UPCGPointData>(Input.Data);
+		const UPCGBasePointData* InputPointData = Cast<UPCGBasePointData>(Input.Data);
 		if (!InputPointData)
 		{
 			continue;
 		}
 
-		const TArray<FPCGPoint>& ParentPoints = InputPointData->GetPoints();
-		if (ParentPoints.Num() == 0)
+		const int32 NumParents = InputPointData->GetNumPoints();
+		if (NumParents == 0)
 		{
 			continue;
 		}
 
-		// Create output point data
-		UPCGPointData* OutputPointData = NewObject<UPCGPointData>();
-		OutputPointData->InitializeFromData(InputPointData);
-		TArray<FPCGPoint>& OutputPoints = OutputPointData->GetMutablePoints();
-		OutputPoints.Reset();
-		OutputPoints.Reserve(ParentPoints.Num() * Settings->PointsPerParent / 2);
+		const TConstPCGValueRange<FTransform> ParentTransforms = InputPointData->GetConstTransformValueRange();
+		const TConstPCGValueRange<int32> ParentSeeds = InputPointData->GetConstSeedValueRange();
 
-		// Track all accepted point positions for global self-pruning
-		TArray<FVector> AcceptedPositions;
-		AcceptedPositions.Reserve(ParentPoints.Num() * Settings->PointsPerParent / 2);
+		// Accumulate accepted children into POD arrays during the trace/filter loop;
+		// the output point data is sized and filled only after the loop (the number of
+		// survivors isn't known up front).
+		const int32 ReserveHint = NumParents * Settings->PointsPerParent / 2;
+		TArray<FTransform> AcceptedTransforms;
+		TArray<int32> AcceptedSeeds;
+		TArray<float> AcceptedDensities;
+		AcceptedTransforms.Reserve(ReserveHint);
+		AcceptedSeeds.Reserve(ReserveHint);
+		AcceptedDensities.Reserve(ReserveHint);
+
+		// XY hash grid for global self-pruning (replaces the former O(n^2) linear scan).
+		PCGExtScatterCommon::FMinDistGrid PruneGrid;
+		PruneGrid.CellSize = FMath::Max(MinPruneDist, 1.0f);
 
 		// ── For each parent point, scatter children ──
 
-		for (int32 ParentIdx = 0; ParentIdx < ParentPoints.Num(); ++ParentIdx)
+		for (int32 ParentIdx = 0; ParentIdx < NumParents; ++ParentIdx)
 		{
-			const FPCGPoint& Parent = ParentPoints[ParentIdx];
-			const FVector ParentPos = Parent.Transform.GetLocation();
+			const FVector ParentPos = ParentTransforms[ParentIdx].GetLocation();
 
 			// Deterministic RNG per parent
-			const int32 ParentSeed = PCGHelpers::ComputeSeed(BaseSeed, Parent.Seed + ParentIdx);
+			const int32 ParentSeed = PCGHelpers::ComputeSeed(BaseSeed, ParentSeeds[ParentIdx] + ParentIdx);
 			FRandomStream Rng(ParentSeed);
 
 			for (int32 ChildIdx = 0; ChildIdx < Settings->PointsPerParent; ++ChildIdx)
@@ -140,6 +146,10 @@ bool FPCGScatterAroundPointsElement::ExecuteInternal(FPCGContext* Context) const
 
 				// Random distance with density weighting:
 				// Uniform random → sqrt for uniform area distribution → then apply falloff
+				// TODO(audit): the comment claims sqrt(U) area-uniform sampling, but the code
+				// below never applies sqrt() to T → the radial distribution is biased toward the
+				// centre independently of the falloff. Distribution left unchanged, you probably 
+				// want to fix this.
 				const float T = Rng.FRandRange(0.0f, 1.0f);
 
 				// Density falloff: probability decreases with distance
@@ -177,7 +187,7 @@ bool FPCGScatterAroundPointsElement::ExecuteInternal(FPCGContext* Context) const
 
 				// ─ 3. Slope filter ─
 
-				const float SlopeDot = FVector::DotProduct(SurfaceNormal, WorldUp);
+				const float SlopeDot = FVector::DotProduct(SurfaceNormal, PCGExtScatterCommon::WorldUp);
 
 				if (SlopeDot < Settings->MinSlopeDot || SlopeDot > Settings->MaxSlopeDot)
 				{
@@ -186,31 +196,25 @@ bool FPCGScatterAroundPointsElement::ExecuteInternal(FPCGContext* Context) const
 
 				// ─ 4. Self-pruning ─
 
-				if (MinPruneDist > 0.0f)
+				if (MinPruneDist > 0.0f && PruneGrid.HasWithin(ProjectedPos, MinPruneDistSq))
 				{
-					bool bTooClose = false;
-					for (const FVector& Existing : AcceptedPositions)
-					{
-						if (FVector::DistSquared(ProjectedPos, Existing) < MinPruneDistSq)
-						{
-							bTooClose = true;
-							break;
-						}
-					}
-					if (bTooClose)
-					{
-						continue;
-					}
+					continue;
 				}
 
-				// ─ 5. Build the output point ─
+				// ─ 5. Build the child (accumulated into POD arrays) ─
 
-				FPCGPoint ChildPoint;
-				ChildPoint.Seed = PCGHelpers::ComputeSeed(ParentSeed, ChildIdx);
-				ChildPoint.Density = 1.0f - FMath::Pow(
+				const int32 ChildSeed = PCGHelpers::ComputeSeed(ParentSeed, ChildIdx);
+
+				// TODO(audit): the falloff is double-counted -- it already thins the child *count*
+				// via the inverse-CDF distance sampling above, and here it attenuates per-child
+				// *density* as well. Edge children are therefore both rarer and fainter. 
+				// Left unchanged (this is the historical behavior).
+				float ChildDensity = 1.0f - FMath::Pow(
 					(Distance - InnerRadius) / RadiusRange,
 					Settings->FalloffExponent);
-				ChildPoint.Density = FMath::Clamp(ChildPoint.Density, 0.0f, 1.0f);
+				ChildDensity = FMath::Clamp(ChildDensity, 0.0f, 1.0f);
+
+				FTransform ChildTransform;
 
 				if (Settings->bProjectionOutputForEmbed)
 				{
@@ -225,7 +229,7 @@ bool FPCGScatterAroundPointsElement::ExecuteInternal(FPCGContext* Context) const
 					// AFTER the Dynamic Mesh Embed.
 
 					const FQuat SurfaceRot = FRotationMatrix::MakeFromZ(SurfaceNormal).ToQuat();
-					ChildPoint.Transform = FTransform(SurfaceRot, ProjectedPos, FVector::OneVector);
+					ChildTransform = FTransform(SurfaceRot, ProjectedPos, FVector::OneVector);
 				}
 				else
 				{
@@ -235,7 +239,7 @@ bool FPCGScatterAroundPointsElement::ExecuteInternal(FPCGContext* Context) const
 
 					// ─ 6. Compute rotation ─
 
-					FRandomStream RotRng(ChildPoint.Seed + 7919);
+					FRandomStream RotRng(ChildSeed + 7919);
 					const FRotator RandomRot(
 						RotRng.FRandRange(Settings->RotationMin.Pitch, Settings->RotationMax.Pitch),
 						RotRng.FRandRange(Settings->RotationMin.Yaw, Settings->RotationMax.Yaw),
@@ -254,7 +258,7 @@ bool FPCGScatterAroundPointsElement::ExecuteInternal(FPCGContext* Context) const
 
 					// ─ 7. Compute scale ─
 
-					FRandomStream ScaleRng(ChildPoint.Seed + 6271);
+					FRandomStream ScaleRng(ChildSeed + 6271);
 					FVector FinalScale;
 					if (Settings->bUniformScale)
 					{
@@ -270,31 +274,65 @@ bool FPCGScatterAroundPointsElement::ExecuteInternal(FPCGContext* Context) const
 
 					// ─ 8. Apply vertical offset ─
 
-					FRandomStream OffsetRng(ChildPoint.Seed + 4513);
+					FRandomStream OffsetRng(ChildSeed + 4513);
 					const float ZOffset = OffsetRng.FRandRange(
 						Settings->VerticalOffsetMin, Settings->VerticalOffsetMax);
 					const FVector FinalPos = ProjectedPos + FVector(0.0, 0.0, ZOffset);
 
 					// ─ 9. Assemble transform ─
 
-					ChildPoint.Transform = FTransform(FinalRotation, FinalPos, FinalScale);
+					ChildTransform = FTransform(FinalRotation, FinalPos, FinalScale);
 				}
 
-				// ── Common to both output modes ──
+				// ── Accept: record in POD arrays + register for self-pruning ──
 
-				ChildPoint.SetExtents(FVector(50.0f));
-				ChildPoint.Steepness = 1.0f;
-
-				OutputPoints.Add(ChildPoint);
-				AcceptedPositions.Add(ProjectedPos);
+				AcceptedTransforms.Add(ChildTransform);
+				AcceptedSeeds.Add(ChildSeed);
+				AcceptedDensities.Add(ChildDensity);
+				PruneGrid.Add(ProjectedPos);
 			}
 		}
 
-		if (OutputPoints.Num() > 0)
+		// ── Materialize the accepted children into a fresh point data set ──
+
+		const int32 NumChildren = AcceptedTransforms.Num();
+		if (NumChildren == 0)
 		{
-			FPCGTaggedData& Output = Outputs.Add_GetRef(Input);
-			Output.Data = OutputPointData;
+			continue;
 		}
+
+		UPCGBasePointData* OutputPointData = FPCGContext::NewPointData_AnyThread(Context);
+		OutputPointData->InitializeFromData(InputPointData);
+		OutputPointData->SetNumPoints(NumChildren, /*bInitializeValues=*/false);
+		OutputPointData->AllocateProperties(
+			EPCGPointNativeProperties::Transform |
+			EPCGPointNativeProperties::Seed |
+			EPCGPointNativeProperties::Density |
+			EPCGPointNativeProperties::Steepness |
+			EPCGPointNativeProperties::BoundsMin |
+			EPCGPointNativeProperties::BoundsMax);
+
+		// Ranges must be fetched AFTER SetNumPoints/AllocateProperties (those invalidate them).
+		TPCGValueRange<FTransform> OutTransforms = OutputPointData->GetTransformValueRange(/*bAllocate=*/false);
+		TPCGValueRange<int32> OutSeeds = OutputPointData->GetSeedValueRange(/*bAllocate=*/false);
+		TPCGValueRange<float> OutDensities = OutputPointData->GetDensityValueRange(/*bAllocate=*/false);
+		TPCGValueRange<float> OutSteepness = OutputPointData->GetSteepnessValueRange(/*bAllocate=*/false);
+		TPCGValueRange<FVector> OutBoundsMin = OutputPointData->GetBoundsMinValueRange(/*bAllocate=*/false);
+		TPCGValueRange<FVector> OutBoundsMax = OutputPointData->GetBoundsMaxValueRange(/*bAllocate=*/false);
+
+		for (int32 ChildIdx = 0; ChildIdx < NumChildren; ++ChildIdx)
+		{
+			OutTransforms[ChildIdx] = AcceptedTransforms[ChildIdx];
+			OutSeeds[ChildIdx] = AcceptedSeeds[ChildIdx];
+			OutDensities[ChildIdx] = AcceptedDensities[ChildIdx];
+			OutSteepness[ChildIdx] = 1.0f;
+			// Former FPCGPoint::SetExtents(FVector(50)) → symmetric ±50 bounds.
+			OutBoundsMin[ChildIdx] = FVector(-50.0);
+			OutBoundsMax[ChildIdx] = FVector(50.0);
+		}
+
+		FPCGTaggedData& Output = Outputs.Add_GetRef(Input);
+		Output.Data = OutputPointData;
 	}
 
 	return true;

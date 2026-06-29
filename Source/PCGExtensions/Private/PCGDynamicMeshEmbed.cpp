@@ -5,11 +5,11 @@
 #include "PCGDynamicMeshEmbed.h"
 
 #include "PCGContext.h"
-#include "PCGPoint.h"
-#include "Data/PCGPointData.h"
+#include "Data/PCGBasePointData.h"
 #include "Metadata/PCGMetadata.h"
-#include "Metadata/PCGMetadataAccessor.h"
+#include "Metadata/PCGMetadataAttribute.h"
 #include "Helpers/PCGHelpers.h"
+#include "Async/PCGAsyncLoadingContext.h"
 #include "Engine/StaticMesh.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(PCGDynamicMeshEmbed)
@@ -51,6 +51,66 @@ TArray<FPCGPinProperties> UPCGDynamicMeshEmbedSettings::OutputPinProperties() co
 FPCGElementPtr UPCGDynamicMeshEmbedSettings::CreateElement() const
 {
 	return MakeShared<FPCGDynamicMeshEmbedElement>();
+}
+
+
+
+// ─────────────────────────────────────────────
+//  Element -- Async resource loading
+// ─────────────────────────────────────────────
+
+bool FPCGDynamicMeshEmbedElement::PrepareDataInternal(FPCGContext* Context) const
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(FPCGDynamicMeshEmbedElement::PrepareData);
+
+	const UPCGDynamicMeshEmbedSettings* Settings = Context->GetInputSettings<UPCGDynamicMeshEmbedSettings>();
+	check(Settings);
+
+	FPCGDynamicMeshEmbedContext* ThisContext = static_cast<FPCGDynamicMeshEmbedContext*>(Context);
+
+	if (!ThisContext->WasLoadRequested())
+	{
+		TArray<FSoftObjectPath> ToLoad;
+		ToLoad.Reserve(Settings->MeshEntries.Num());
+		for (const FPCGEmbedMeshEntry& Entry : Settings->MeshEntries)
+		{
+			if (!Entry.Mesh.IsNull())
+			{
+				ToLoad.Add(Entry.Mesh.ToSoftObjectPath());
+			}
+		}
+
+		// Async load suspends the task (returns false) until streaming completes; on resume
+		// WasLoadRequested() is true so we skip straight to caching below. A synchronous load
+		// returns true immediately and falls through to caching on this same pass.
+		if (!ThisContext->RequestResourceLoad(ThisContext, MoveTemp(ToLoad), !Settings->bSynchronousLoad))
+		{
+			return false;
+		}
+	}
+
+	// ── Resolve mesh bounds on the game thread and cache them on the context. ──
+	// Reading UStaticMesh bounds off the game thread is unsafe, so it happens here in the
+	// PrepareData phase rather than in ExecuteInternal (which runs on a worker thread).
+	if (!ThisContext->bCacheBuilt)
+	{
+		TArray<FSoftObjectPath> FailedPaths;
+		PCGExtScatterCommon::BuildMeshBoundsCache(
+			Settings->MeshEntries, ThisContext->MeshCache, ThisContext->TotalWeight, &FailedPaths);
+
+		for (const FSoftObjectPath& Failed : FailedPaths)
+		{
+			PCGE_LOG(Warning, GraphAndLog,
+				FText::Format(
+					NSLOCTEXT("PCGDynamicMeshEmbed", "MeshLoadFail",
+						"Dynamic Mesh Embed: Failed to load mesh '{0}', skipping."),
+					FText::FromString(Failed.ToString())));
+		}
+
+		ThisContext->bCacheBuilt = true;
+	}
+
+	return true;
 }
 
 
@@ -103,54 +163,16 @@ bool FPCGDynamicMeshEmbedElement::ExecuteInternal(FPCGContext* Context) const
 	const UPCGDynamicMeshEmbedSettings* Settings = Context->GetInputSettings<UPCGDynamicMeshEmbedSettings>();
 	check(Settings);
 
-	// ── Validate mesh entries ──
+	FPCGDynamicMeshEmbedContext* ThisContext = static_cast<FPCGDynamicMeshEmbedContext*>(Context);
 
-	if (Settings->MeshEntries.Num() == 0)
-	{
-		PCGE_LOG(Error, GraphAndLog, NSLOCTEXT("PCGDynamicMeshEmbed", "NoMeshes",
-			"Dynamic Mesh Embed: No mesh entries configured."));
-		return true;
-	}
-
-	// ── Load meshes and cache bounding boxes ──
-
-	TArray<FPCGMeshBoundsCache> MeshCache;
-	MeshCache.Reserve(Settings->MeshEntries.Num());
-	float TotalWeight = 0.0f;
-
-	for (const FPCGEmbedMeshEntry& Entry : Settings->MeshEntries)
-	{
-		UStaticMesh* LoadedMesh = Entry.Mesh.Get();
-		if (!LoadedMesh)
-		{
-			PCGE_LOG(Warning, GraphAndLog,
-				FText::Format(
-					NSLOCTEXT("PCGDynamicMeshEmbed", "MeshLoadFail",
-						"Dynamic Mesh Embed: Failed to load mesh '{0}', skipping."),
-					FText::FromString(Entry.Mesh.ToString())));
-			continue;
-		}
-
-		FPCGMeshBoundsCache CacheEntry;
-		CacheEntry.MeshPath = FSoftObjectPath(LoadedMesh);
-
-		// Get the mesh's local-space bounding box.
-		// This respects the pivot point — if pivot is at base centre,
-		// BoundsMin.Z ≈ 0 and BoundsMax.Z = full height.
-		const FBox MeshBounds = LoadedMesh->GetBoundingBox();
-		CacheEntry.BoundsMin = MeshBounds.Min;
-		CacheEntry.BoundsMax = MeshBounds.Max;
-
-		TotalWeight += FMath::Max(Entry.Weight, 0.01f);
-		CacheEntry.CumulativeWeight = TotalWeight;
-
-		MeshCache.Add(CacheEntry);
-	}
+	// Mesh bounds were resolved on the game thread during PrepareData; here we only read them.
+	const TArray<PCGExtScatterCommon::FMeshBoundsCache>& MeshCache = ThisContext->MeshCache;
+	const float TotalWeight = ThisContext->TotalWeight;
 
 	if (MeshCache.Num() == 0)
 	{
 		PCGE_LOG(Error, GraphAndLog, NSLOCTEXT("PCGDynamicMeshEmbed", "NoValidMeshes",
-			"Dynamic Mesh Embed: No valid meshes could be loaded."));
+			"Dynamic Mesh Embed: No valid mesh entries configured or loaded."));
 		return true;
 	}
 
@@ -159,37 +181,34 @@ bool FPCGDynamicMeshEmbedElement::ExecuteInternal(FPCGContext* Context) const
 	TArray<FPCGTaggedData> Inputs = Context->InputData.GetAllInputs();
 	TArray<FPCGTaggedData>& Outputs = Context->OutputData.TaggedData;
 
+	const int32 BaseSeed = Settings->GetSeed(Context->ExecutionSource.Get());
+
 	for (const FPCGTaggedData& Input : Inputs)
 	{
-		const UPCGPointData* InputPointData = Cast<UPCGPointData>(Input.Data);
+		const UPCGBasePointData* InputPointData = Cast<UPCGBasePointData>(Input.Data);
 		if (!InputPointData)
 		{
 			continue;
 		}
 
-		const TArray<FPCGPoint>& InputPoints = InputPointData->GetPoints();
-		if (InputPoints.Num() == 0)
+		const int32 NumPoints = InputPointData->GetNumPoints();
+		if (NumPoints == 0)
 		{
 			continue;
 		}
 
-		// Create output point data as a copy of input
-		UPCGPointData* OutputPointData = NewObject<UPCGPointData>();
-		OutputPointData->InitializeFromData(InputPointData);
+		// 1:1 copy-and-modify: duplicate the input (points + parented metadata) and
+		// edit it in place through value ranges.
+		UPCGBasePointData* OutputPointData = CastChecked<UPCGBasePointData>(InputPointData->DuplicateData(Context));
 
-		TArray<FPCGPoint>& OutputPoints = OutputPointData->GetMutablePoints();
-		OutputPoints = InputPoints; // Deep copy
-
-		// Create the mesh path attribute on the output metadata
+		// Create the mesh-path attribute as a SoftObjectPath so the Static Mesh Spawner
+		// "By Attribute" selector consumes it natively.
 		UPCGMetadata* Metadata = OutputPointData->MutableMetadata();
+		Metadata->CreateSoftObjectPathAttribute(
+			Settings->MeshPathAttributeName, FSoftObjectPath(), /*bAllowsInterpolation=*/false);
 
-		// Use FindOrCreateAttribute to get/create a string attribute for mesh paths
-		FPCGMetadataAttribute<FString>* MeshPathAttr =
-			Metadata->FindOrCreateAttribute<FString>(
-				Settings->MeshPathAttributeName,
-				FString(),         // Default value
-				/*bAllowInterpolation=*/false,
-				/*bOverrideParent=*/true);
+		FPCGMetadataAttribute<FSoftObjectPath>* MeshPathAttr =
+			Metadata->GetMutableTypedAttribute<FSoftObjectPath>(Settings->MeshPathAttributeName);
 
 		if (!MeshPathAttr)
 		{
@@ -200,20 +219,20 @@ bool FPCGDynamicMeshEmbedElement::ExecuteInternal(FPCGContext* Context) const
 
 		// ── Process each point ──
 
-		const int32 BaseSeed = Settings->GetSeed(Context->ExecutionSource.Get());
+		const TConstPCGValueRange<int32> SeedRange = OutputPointData->GetConstSeedValueRange();
+		TPCGValueRange<FTransform> TransformRange = OutputPointData->GetTransformValueRange();
+		TPCGValueRange<int64> MetadataEntryRange = OutputPointData->GetMetadataEntryValueRange();
 
-		for (int32 PointIdx = 0; PointIdx < OutputPoints.Num(); ++PointIdx)
+		for (int32 PointIdx = 0; PointIdx < NumPoints; ++PointIdx)
 		{
-			FPCGPoint& Point = OutputPoints[PointIdx];
-
 			// ─ 1. Random mesh selection (deterministic using point seed) ─
 
-			// Combine base seed with point seed for deterministic per-point randomness
-			const int32 PointSeed = PCGHelpers::ComputeSeed(BaseSeed, Point.Seed);
+			const int32 PointSeed = PCGHelpers::ComputeSeed(BaseSeed, SeedRange[PointIdx]);
 			FRandomStream Rng(PointSeed);
 			const float RollValue = Rng.FRandRange(0.0f, TotalWeight);
 
-			int32 SelectedMeshIdx = 0;
+			// Fall back to the last bucket so float rounding can't bias toward mesh 0.
+			int32 SelectedMeshIdx = MeshCache.Num() - 1;
 			for (int32 MeshIdx = 0; MeshIdx < MeshCache.Num(); ++MeshIdx)
 			{
 				if (RollValue <= MeshCache[MeshIdx].CumulativeWeight)
@@ -223,17 +242,18 @@ bool FPCGDynamicMeshEmbedElement::ExecuteInternal(FPCGContext* Context) const
 				}
 			}
 
-			const FPCGMeshBoundsCache& SelectedMesh = MeshCache[SelectedMeshIdx];
+			const PCGExtScatterCommon::FMeshBoundsCache& SelectedMesh = MeshCache[SelectedMeshIdx];
 
-			// ─ 2. Store the mesh path as an attribute ─
+			// ─ 2. Store the mesh path as an attribute (preserving inherited entries) ─
 
-			Metadata->InitializeOnSet(Point.MetadataEntry);
-			MeshPathAttr->SetValue(Point.MetadataEntry, SelectedMesh.MeshPath.ToString());
+			Metadata->InitializeOnSet(MetadataEntryRange[PointIdx]);
+			MeshPathAttr->SetValue(MetadataEntryRange[PointIdx], SelectedMesh.MeshPath);
 
 			// ─ 3. Extract the surface normal from the point's transform ─
 			//      The Surface Sampler orients points so local Z = surface normal
 
-			const FVector SurfaceNormal = Point.Transform.GetRotation().GetUpVector();
+			FTransform& PointTransform = TransformRange[PointIdx];
+			const FVector SurfaceNormal = PointTransform.GetRotation().GetUpVector();
 
 			// ─ 4. Compute embed distance via bounding box support function ─
 
@@ -249,7 +269,7 @@ bool FPCGDynamicMeshEmbedElement::ExecuteInternal(FPCGContext* Context) const
 			{
 				// Use uniform scale (X component). If non-uniform scale is used,
 				// this would need per-axis scaling of the bounds instead.
-				const float UniformScale = Point.Transform.GetScale3D().X;
+				const float UniformScale = PointTransform.GetScale3D().X;
 				EmbedDistance *= UniformScale;
 			}
 
@@ -257,9 +277,7 @@ bool FPCGDynamicMeshEmbedElement::ExecuteInternal(FPCGContext* Context) const
 			//      Negative normal direction = into the surface
 
 			const FVector EmbedOffset = -SurfaceNormal * EmbedDistance;
-			FVector CurrentPos = Point.Transform.GetLocation();
-			CurrentPos += EmbedOffset;
-			Point.Transform.SetLocation(CurrentPos);
+			PointTransform.SetLocation(PointTransform.GetLocation() + EmbedOffset);
 		}
 
 		// ── Emit output ──
