@@ -5,8 +5,7 @@
 #include "PCGGroundCoverScatter.h"
 
 #include "PCGContext.h"
-#include "PCGPoint.h"
-#include "Data/PCGPointData.h"
+#include "Data/PCGBasePointData.h"
 #include "Data/PCGSpatialData.h"
 #include "Metadata/PCGMetadata.h"
 #include "Metadata/PCGMetadataAttribute.h"
@@ -15,12 +14,14 @@
 #include "Engine/StaticMesh.h"
 #include "CollisionQueryParams.h"
 
+#include "PCGExtScatterCommon.h"
+
 #include UE_INLINE_GENERATED_CPP_BY_NAME(PCGGroundCoverScatter)
 
-namespace
+// File-local noise helpers. A named namespace (not anonymous / not `static`) so the
+// Unity build can't collide these with same-named helpers in sibling scatter .cpp files.
+namespace PCGGroundCoverScatter
 {
-	const FName RejectedLabel(TEXT("Rejected"));
-
 	// ── Deterministic per-cell hash → two floats in [0,1). Used by Worley + Random. ──
 	FORCEINLINE FVector2D CellRandom2(int32 CX, int32 CY, int32 Seed)
 	{
@@ -62,41 +63,6 @@ namespace
 		const FVector2D R = CellRandom2(FMath::RoundToInt(Pos.X), FMath::RoundToInt(Pos.Y), Seed);
 		return R.X;
 	}
-
-	// ── Uniform XY hash grid for min-distance pruning. Cell size must be >= query radius. ──
-	struct FMinDistGrid
-	{
-		float CellSize = 100.0f;
-		TMap<FIntPoint, TArray<FVector>> Cells;
-
-		FORCEINLINE FIntPoint CellOf(const FVector& P) const
-		{
-			return FIntPoint(FMath::FloorToInt(P.X / CellSize), FMath::FloorToInt(P.Y / CellSize));
-		}
-		FORCEINLINE void Add(const FVector& P) { Cells.FindOrAdd(CellOf(P)).Add(P); }
-
-		bool HasWithin(const FVector& P, float RadiusSq) const
-		{
-			const FIntPoint C = CellOf(P);
-			for (int32 dx = -1; dx <= 1; ++dx)
-			{
-				for (int32 dy = -1; dy <= 1; ++dy)
-				{
-					if (const TArray<FVector>* Arr = Cells.Find(FIntPoint(C.X + dx, C.Y + dy)))
-					{
-						for (const FVector& Q : *Arr)
-						{
-							if (FVector::DistSquared(P, Q) < RadiusSq)
-							{
-								return true;
-							}
-						}
-					}
-				}
-			}
-			return false;
-		}
-	};
 }
 
 // ─────────────────────────────────────────────
@@ -157,7 +123,7 @@ TArray<FPCGPinProperties> UPCGGroundCoverScatterSettings::OutputPinProperties() 
 			"Placed ground-cover instances with a MeshPath attribute. Feed a By-Attribute "
 			"Static Mesh Spawner."));
 
-	Pins.Emplace(RejectedLabel,
+	Pins.Emplace(PCGExtScatterCommon::RejectedPinLabel,
 		EPCGDataType::Point,
 		/*bAllowMultipleConnections=*/true,
 		/*bAllowMultipleData=*/true,
@@ -185,14 +151,13 @@ bool FPCGGroundCoverScatterElement::BuildMeshCache(
 
 	for (const FPCGGroundMeshEntry& Entry : Entries)
 	{
-		UStaticMesh* LoadedMesh = Entry.Mesh.Get();
-		if (!LoadedMesh)
+		if (Entry.Mesh.IsNull())
 		{
 			continue;
 		}
 
 		FGroundMeshCache CacheEntry;
-		CacheEntry.MeshPath = FSoftObjectPath(LoadedMesh);
+		CacheEntry.MeshPath = Entry.Mesh.ToSoftObjectPath();
 		CacheEntry.ScaleRange = Entry.ScaleRange;
 		OutTotalWeight += FMath::Max(Entry.Weight, 0.01f);
 		CacheEntry.CumulativeWeight = OutTotalWeight;
@@ -364,21 +329,25 @@ float FPCGGroundCoverScatterElement::SampleNoiseStack(
 		}
 		case EPCGGroundNoiseType::Worley_F1:
 		{
+			// TODO(audit): Worley returns raw cell-distance (in cell units), not normalised
+			// to [0,1]. F1 routinely exceeds 1 except near a feature centre, so the Clamp
+			// floors most of the field at 1.0; with the default inverted-Multiply layer this
+			// culls heavily/unevenly. Math left unchanged.
 			float F1, F2;
-			Worley2D(FVector2D(Position.X, Position.Y) * L.Frequency, L.Seed, F1, F2);
+			PCGGroundCoverScatter::Worley2D(FVector2D(Position.X, Position.Y) * L.Frequency, L.Seed, F1, F2);
 			V = FMath::Clamp(F1, 0.0f, 1.0f); // 0 at feature centre → 1 at cell edge
 			break;
 		}
 		case EPCGGroundNoiseType::Worley_F2MinusF1:
 		{
 			float F1, F2;
-			Worley2D(FVector2D(Position.X, Position.Y) * L.Frequency, L.Seed, F1, F2);
+			PCGGroundCoverScatter::Worley2D(FVector2D(Position.X, Position.Y) * L.Frequency, L.Seed, F1, F2);
 			V = FMath::Clamp(F2 - F1, 0.0f, 1.0f); // ridge lines between cells
 			break;
 		}
 		case EPCGGroundNoiseType::Random:
 		{
-			V = PosRandom01(Position, L.Seed);
+			V = PCGGroundCoverScatter::PosRandom01(Position, L.Seed);
 			break;
 		}
 		}
@@ -436,30 +405,19 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 			"Ground Cover Scatter: No valid meshes in Mesh Set."));
 		return true;
 	}
-
-
-	float ExclCellSize = 500.0f;
-	TMap<FIntPoint, TArray<int32>> ExclGrid;
-	auto ExclCellOf = [ExclCellSize](float X, float Y)
-		{
-			return FIntPoint(FMath::FloorToInt(X / ExclCellSize), FMath::FloorToInt(Y / ExclCellSize));
-		};
-
-
 	// ── Validate config ──
 	const float MinSlope = FMath::Min(Settings->MinSlopeDot, Settings->MaxSlopeDot);
 	const float MaxSlope = FMath::Max(Settings->MinSlopeDot, Settings->MaxSlopeDot);
 	const float MinDist = FMath::Max(Settings->MinDistance, 0.0f);
 	const float MinDistSq = MinDist * MinDist;
 	const int32 BaseSeed = Settings->GetSeed(Context->ExecutionSource.Get());
-	const FVector WorldUp(0.0, 0.0, 1.0);
 
 	FCollisionQueryParams QueryParams;
 	QueryParams.bTraceComplex = false;
 	QueryParams.bReturnPhysicalMaterial = false;
 
 	// Min-distance acceleration grid (cell size must be >= MinDistance for the 3x3 lookup).
-	FMinDistGrid SpacingGrid;
+	PCGExtScatterCommon::FMinDistGrid SpacingGrid;
 	SpacingGrid.CellSize = FMath::Max(MinDist, 1.0f);
 
 	auto Project = [&](const FVector& XY, double RefZ, FVector& OutPos, FVector& OutNormal) -> bool
@@ -481,60 +439,59 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 	const TArray<FPCGTaggedData> CandidateInputs =
 		Context->InputData.GetInputsByPin(PCGPinConstants::DefaultInputLabel);
 
-	UPCGPointData* OutData = nullptr;
-	UPCGPointData* RejData = nullptr;
-	FPCGMetadataAttribute<FString>* MeshPathAttr = nullptr;
-
+	// One output (and optional Rejected) per input data set -- initialised from THAT input's
+	// schema/metadata. Keying a single shared output to the first input drops the other inputs'
+	// attributes; per-input outputs preserve each input's biome/metadata parentage.
 	for (const FPCGTaggedData& Input : CandidateInputs)
 	{
-		const UPCGPointData* InData = Cast<UPCGPointData>(Input.Data);
+		const UPCGBasePointData* InData = Cast<UPCGBasePointData>(Input.Data);
 		if (!InData)
 		{
 			continue;
 		}
-		const TArray<FPCGPoint>& InPoints = InData->GetPoints();
-		if (InPoints.Num() == 0)
+		const int32 NumCandidates = InData->GetNumPoints();
+		if (NumCandidates == 0)
 		{
 			continue;
 		}
 		const UPCGMetadata* InMeta = InData->ConstMetadata();
 
-		// Lazily create outputs from the first valid input (schema source).
-		if (!OutData)
-		{
-			OutData = NewObject<UPCGPointData>();
-			OutData->InitializeFromData(InData);
-			UPCGMetadata* InitMeta = OutData->MutableMetadata();
-			MeshPathAttr = InitMeta->FindOrCreateAttribute<FString>(
-				Settings->MeshPathAttributeName, FString(),
-				/*bAllowInterpolation=*/false, /*bOverrideParent=*/true);
+		const TConstPCGValueRange<FTransform> InTransforms = InData->GetConstTransformValueRange();
+		const TConstPCGValueRange<int32> InSeeds = InData->GetConstSeedValueRange();
+		const TConstPCGValueRange<float> InDensities = InData->GetConstDensityValueRange();
+		const TConstPCGValueRange<int64> InMetadataEntries = InData->GetConstMetadataEntryValueRange();
 
-			if (Settings->bOutputRejected)
-			{
-				RejData = NewObject<UPCGPointData>();
-				RejData->InitializeFromData(InData);
-			}
+		// One generated instance per accepted candidate. Buffered because the kept count is
+		// only known after the filter pass (line trace / noise / spacing reject variably).
+		struct FInstance
+		{
+			FTransform Transform;
+			float Density;
+			FSoftObjectPath MeshPath;
+		};
+		TArray<FInstance> Instances;
+		Instances.Reserve(NumCandidates);
+
+		// Scattered candidate indices that were culled (for the optional Rejected output).
+		TArray<int32> RejectedIndices;
+		if (Settings->bOutputRejected)
+		{
+			RejectedIndices.Reserve(NumCandidates);
 		}
 
-		TArray<FPCGPoint>& OutPoints = OutData->GetMutablePoints();
-		TArray<FPCGPoint>* RejPoints = RejData ? &RejData->GetMutablePoints() : nullptr;
-		UPCGMetadata* OutMeta = OutData->MutableMetadata();
-
-		OutPoints.Reserve(OutPoints.Num() + InPoints.Num());
-
-		for (int32 Idx = 0; Idx < InPoints.Num(); ++Idx)
+		for (int32 Idx = 0; Idx < NumCandidates; ++Idx)
 		{
-			const FPCGPoint& Cand = InPoints[Idx];
-			const FVector CandPos = Cand.Transform.GetLocation();
+			const FTransform& CandTransform = InTransforms[Idx];
+			const FVector CandPos = CandTransform.GetLocation();
 
-			const int32 PointSeed = PCGHelpers::ComputeSeed(BaseSeed, Cand.Seed + Idx);
+			const int32 PointSeed = PCGHelpers::ComputeSeed(BaseSeed, InSeeds[Idx] + Idx);
 			FRandomStream Rng(PointSeed);
 
 			auto Reject = [&]()
 				{
-					if (RejPoints)
+					if (Settings->bOutputRejected)
 					{
-						RejPoints->Add(Cand);
+						RejectedIndices.Add(Idx);
 					}
 				};
 
@@ -555,7 +512,7 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 			}
 
 			// 2. Slope band.
-			const float SlopeDot = FVector::DotProduct(Normal, WorldUp);
+			const float SlopeDot = FVector::DotProduct(Normal, PCGExtScatterCommon::WorldUp);
 			if (SlopeDot < MinSlope || SlopeDot > MaxSlope)
 			{
 				Reject();
@@ -577,7 +534,7 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 			// 4. Biome response.
 			float BiomeDensity = 1.0f, BiomeScale = 1.0f;
 			ComputeBiomeFactors(Settings->BiomeResponses, Settings->BiomeCombineMode,
-				InMeta, Cand.MetadataEntry, BiomeDensity, BiomeScale);
+				InMeta, InMetadataEntries[Idx], BiomeDensity, BiomeScale);
 
 
 			const float Keep = FMath::Clamp(
@@ -600,12 +557,6 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 			}
 
 			// 8. Build the instance.
-			FPCGPoint NewPoint = Cand;
-			NewPoint.Seed = PointSeed;
-			NewPoint.Density = Settings->bWriteDensity ? Keep : Cand.Density;
-			NewPoint.Steepness = 1.0f;
-			NewPoint.SetExtents(FVector(8.0f));
-
 			const int32 MeshIdx = SelectMeshIndex(MeshCache, MeshTotalWeight, Rng);
 			const FGroundMeshCache& Chosen = MeshCache[MeshIdx];
 
@@ -624,36 +575,90 @@ bool FPCGGroundCoverScatterElement::ExecuteInternal(FPCGContext* Context) const
 				Settings->SlopeAlignAmount, Settings->MaxAlignAngleDeg, JitterP, JitterR);
 
 			const FVector FinalPos = ProjPos + FVector(0.0, 0.0, Settings->ZOffset);
-			NewPoint.Transform = FTransform(Rot, FinalPos, FVector(FinalScale));
 
-			// Fresh metadata entry for the mesh path.
-			NewPoint.MetadataEntry = PCGInvalidEntryKey;
-			OutMeta->InitializeOnSet(NewPoint.MetadataEntry);
-			if (MeshPathAttr)
-			{
-				MeshPathAttr->SetValue(NewPoint.MetadataEntry, Chosen.MeshPath.ToString());
-			}
+			FInstance& Inst = Instances.Emplace_GetRef();
+			Inst.Transform = FTransform(Rot, FinalPos, FVector(FinalScale));
+			Inst.Density = Settings->bWriteDensity ? Keep : InDensities[Idx];
+			Inst.MeshPath = Chosen.MeshPath;
 
-			OutPoints.Add(NewPoint);
 			if (MinDist > 0.0f)
 			{
 				SpacingGrid.Add(ProjPos);
 			}
 		}
-	}
 
-	// ── Emit ──
-	if (OutData && OutData->GetPoints().Num() > 0)
-	{
-		FPCGTaggedData& T = Outputs.Emplace_GetRef();
-		T.Data = OutData;
-		T.Pin = PCGPinConstants::DefaultOutputLabel;
-	}
-	if (RejData && RejData->GetPoints().Num() > 0)
-	{
-		FPCGTaggedData& T = Outputs.Emplace_GetRef();
-		T.Data = RejData;
-		T.Pin = RejectedLabel;
+		// ── Default output: generate the accepted instances ──
+		if (Instances.Num() > 0)
+		{
+			UPCGBasePointData* OutData = FPCGContext::NewPointData_AnyThread(Context);
+			FPCGInitializeFromDataParams InitParams(InData);
+			OutData->InitializeFromDataWithParams(InitParams);
+			OutData->SetNumPoints(Instances.Num(), /*bInitializeValues=*/false);
+			OutData->AllocateProperties(
+				EPCGPointNativeProperties::Transform | EPCGPointNativeProperties::Density |
+				EPCGPointNativeProperties::BoundsMin | EPCGPointNativeProperties::BoundsMax |
+				EPCGPointNativeProperties::Steepness | EPCGPointNativeProperties::Seed |
+				EPCGPointNativeProperties::MetadataEntry);
+
+			// SoftObjectPath attribute so a By-Attribute Static Mesh Spawner consumes it natively.
+			UPCGMetadata* OutMeta = OutData->MutableMetadata();
+			OutMeta->CreateSoftObjectPathAttribute(
+				Settings->MeshPathAttributeName, FSoftObjectPath(), /*bAllowsInterpolation=*/false);
+			FPCGMetadataAttribute<FSoftObjectPath>* MeshPathAttr =
+				OutMeta->GetMutableTypedAttribute<FSoftObjectPath>(Settings->MeshPathAttributeName);
+
+			TPCGValueRange<FTransform> OutTransforms = OutData->GetTransformValueRange();
+			TPCGValueRange<float> OutDensities = OutData->GetDensityValueRange();
+			TPCGValueRange<FVector> OutBoundsMin = OutData->GetBoundsMinValueRange();
+			TPCGValueRange<FVector> OutBoundsMax = OutData->GetBoundsMaxValueRange();
+			TPCGValueRange<float> OutSteepness = OutData->GetSteepnessValueRange();
+			TPCGValueRange<int32> OutSeeds = OutData->GetSeedValueRange();
+			TPCGValueRange<int64> OutMetadataEntries = OutData->GetMetadataEntryValueRange();
+
+			for (int32 i = 0; i < Instances.Num(); ++i)
+			{
+				const FInstance& Inst = Instances[i];
+				OutTransforms[i] = Inst.Transform;
+				OutDensities[i] = Inst.Density;
+				OutBoundsMin[i] = FVector(-8.0);
+				OutBoundsMax[i] = FVector(8.0);
+				OutSteepness[i] = 1.0f;
+				OutSeeds[i] = PCGHelpers::ComputeSeedFromPosition(Inst.Transform.GetLocation());
+
+				// Fresh metadata entry per instance for the mesh path.
+				OutMetadataEntries[i] = PCGInvalidEntryKey;
+				OutMeta->InitializeOnSet(OutMetadataEntries[i]);
+				if (MeshPathAttr)
+				{
+					MeshPathAttr->SetValue(OutMetadataEntries[i], Inst.MeshPath);
+				}
+			}
+
+			FPCGTaggedData& T = Outputs.Emplace_GetRef(Input);
+			T.Data = OutData;
+			T.Pin = PCGPinConstants::DefaultOutputLabel;
+		}
+
+		// ── Rejected output: copy culled candidates verbatim (preserves their metadata) ──
+		if (Settings->bOutputRejected && RejectedIndices.Num() > 0)
+		{
+			UPCGBasePointData* RejData = FPCGContext::NewPointData_AnyThread(Context);
+			FPCGInitializeFromDataParams RejInitParams(InData);
+			RejData->InitializeFromDataWithParams(RejInitParams);
+			RejData->SetNumPoints(RejectedIndices.Num(), /*bInitializeValues=*/false);
+
+			TArray<int32> WriteIndices;
+			WriteIndices.SetNumUninitialized(RejectedIndices.Num());
+			for (int32 i = 0; i < RejectedIndices.Num(); ++i)
+			{
+				WriteIndices[i] = i;
+			}
+			InData->CopyPointsTo(RejData, RejectedIndices, WriteIndices);
+
+			FPCGTaggedData& T = Outputs.Emplace_GetRef(Input);
+			T.Data = RejData;
+			T.Pin = PCGExtScatterCommon::RejectedPinLabel;
+		}
 	}
 
 	return true;

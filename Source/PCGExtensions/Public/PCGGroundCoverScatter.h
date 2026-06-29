@@ -24,6 +24,7 @@
 #include "CoreMinimal.h"
 #include "PCGSettings.h"
 #include "PCGElement.h"
+#include "PCGContext.h"
 #include "Engine/StaticMesh.h"
 
 #include "PCGGroundCoverScatter.generated.h"
@@ -324,9 +325,11 @@ public:
 //  Element
 // ─────────────────────────────────────────────
 
-class PCGEXTENSIONS_API FPCGGroundCoverScatterElement : public IPCGElement
+class PCGEXTENSIONS_API FPCGGroundCoverScatterElement
+	: public IPCGElement
 {
 protected:
+	virtual bool SupportsBasePointDataInputs(FPCGContext* InContext) const override { return true; }
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;
 
 private:

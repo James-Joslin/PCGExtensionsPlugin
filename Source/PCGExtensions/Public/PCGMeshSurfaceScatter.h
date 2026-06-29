@@ -25,6 +25,8 @@
 #include "CoreMinimal.h"
 #include "PCGSettings.h"
 #include "PCGElement.h"
+#include "PCGContext.h"
+#include "Async/PCGAsyncLoadingContext.h"
 #include "Engine/StaticMesh.h"
 
 #include "PCGMeshSurfaceScatter.generated.h"
@@ -301,15 +303,56 @@ public:
 	/** Log per-rock sampling stats (eligible area, point counts). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
 	bool bLogStats = false;
+
+	/** By default mesh loading is asynchronous; force synchronous if a downstream step needs it immediately. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Settings|Debug")
+	bool bSynchronousLoad = false;
 };
 
 // ─────────────────────────────────────────────
 //  Element
 // ─────────────────────────────────────────────
 
-class PCGEXTENSIONS_API FPCGMeshSurfaceScatterElement : public IPCGElement
+/**
+ * Context carries the async-loading state (streamable handle + loaded refs) plus the
+ * actor-tag fallback discovery resolved on the game thread during PrepareData. The
+ * TActorIterator world walk is game-thread-only, so its results are cached here to
+ * survive PrepareData → Execute; ExecuteInternal then runs on a worker thread and only
+ * reads FallbackRocks (resolving already-resident meshes via .Get()).
+ */
+struct FPCGMeshSurfaceScatterContext : public FPCGContext, public IPCGAsyncLoadingContext
 {
+	/** One discovered tagged-actor StaticMeshComponent: its mesh + world transform. */
+	struct FFallbackRock
+	{
+		// Soft path keeps the resolve worker-safe; the mesh comes from an already-spawned
+		// component so it is resident and .Get() returns it without a sync load.
+		TSoftObjectPtr<UStaticMesh> Mesh;
+		FTransform WorldTransform;
+	};
+
+	TArray<FFallbackRock> FallbackRocks;
+	bool bFallbackGathered = false;
+};
+
+class PCGEXTENSIONS_API FPCGMeshSurfaceScatterElement
+	: public IPCGElementWithCustomContext<FPCGMeshSurfaceScatterContext>
+{
+public:
+	// Only the PrepareData phase must run on the main thread: it does the resource loading
+	// and the game-thread-only TActorIterator world walk (actor-tag fallback discovery).
+	// The Execute phase -- line traces, per-point math, and BuildTopology's RenderData
+	// readback (meshes require "Allow CPU Access", so the CPU-side buffers are worker-safe)
+	// -- runs on workers.
+	// (Context is null when the scheduler probes context-creation affinity -- allow workers then.)
+	virtual bool CanExecuteOnlyOnMainThread(FPCGContext* Context) const override
+	{
+		return Context && Context->CurrentPhase == EPCGExecutionPhase::PrepareData;
+	}
+
 protected:
+	virtual bool SupportsBasePointDataInputs(FPCGContext* InContext) const override { return true; }
+	virtual bool PrepareDataInternal(FPCGContext* Context) const override;
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;
 
 private:

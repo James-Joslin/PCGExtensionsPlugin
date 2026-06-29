@@ -5,22 +5,16 @@
 #include "PCGTieredVegetationScatter.h"
 
 #include "PCGContext.h"
-#include "PCGPoint.h"
-#include "Data/PCGPointData.h"
+#include "Data/PCGBasePointData.h"
 #include "Metadata/PCGMetadata.h"
 #include "Metadata/PCGMetadataAttribute.h"
 #include "Helpers/PCGHelpers.h"
 #include "Engine/World.h"
 #include "Engine/StaticMesh.h"
 #include "CollisionQueryParams.h"
+#include "PCGExtScatterCommon.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(PCGTieredVegetationScatter)
-
-namespace
-{
-	const FName CompanionsLabel(TEXT("Companions"));
-	const FName RejectedLabel(TEXT("Rejected"));
-}
 
 // ─────────────────────────────────────────────
 //  Settings — pins
@@ -54,7 +48,7 @@ TArray<FPCGPinProperties> UPCGTieredVegetationScatterSettings::OutputPinProperti
 			"Placed instances with a MeshPath attribute. Feed a By-Attribute Static Mesh "
 			"Spawner, and/or this tier's Exclusion Sources for the next tier down."));
 
-	Pins.Emplace(CompanionsLabel,
+	Pins.Emplace(PCGExtScatterCommon::CompanionsPinLabel,
 		EPCGDataType::Point,
 		/*bAllowMultipleConnections=*/true,
 		/*bAllowMultipleData=*/true,
@@ -62,7 +56,7 @@ TArray<FPCGPinProperties> UPCGTieredVegetationScatterSettings::OutputPinProperti
 			"Optional understory ring points (transform-ready, mesh-less). Assign shrub "
 			"meshes downstream or pipe into Scatter Around Points."));
 
-	Pins.Emplace(RejectedLabel,
+	Pins.Emplace(PCGExtScatterCommon::RejectedPinLabel,
 		EPCGDataType::Point,
 		/*bAllowMultipleConnections=*/true,
 		/*bAllowMultipleData=*/true,
@@ -91,14 +85,13 @@ bool FPCGTieredVegetationScatterElement::BuildMeshCache(
 
 	for (const FPCGVegMeshEntry& Entry : Entries)
 	{
-		UStaticMesh* LoadedMesh = Entry.Mesh.Get();
-		if (!LoadedMesh)
+		if (Entry.Mesh.IsNull())
 		{
 			continue;
 		}
 
 		FVegMeshCache CacheEntry;
-		CacheEntry.MeshPath = FSoftObjectPath(LoadedMesh);
+		CacheEntry.MeshPath = Entry.Mesh.ToSoftObjectPath();
 		CacheEntry.ScaleRange = Entry.ScaleRange;
 		OutTotalWeight += FMath::Max(Entry.Weight, 0.01f);
 		CacheEntry.CumulativeWeight = OutTotalWeight;
@@ -137,24 +130,6 @@ float FPCGTieredVegetationScatterElement::ReadFloatAttr(
 	}
 
 	const FPCGMetadataAttribute<float>* Attr = static_cast<const FPCGMetadataAttribute<float>*>(Base);
-	return Attr->GetValueFromItemKey(EntryKey);
-}
-
-FString FPCGTieredVegetationScatterElement::ReadStringAttr(
-	const UPCGMetadata* Meta, FName Name, int64 EntryKey)
-{
-	if (!Meta || Name.IsNone() || !Meta->HasAttribute(Name))
-	{
-		return FString();
-	}
-
-	const FPCGMetadataAttributeBase* Base = Meta->GetConstAttribute(Name);
-	if (!Base || Base->GetTypeId() != PCG::Private::MetadataTypes<FString>::Id)
-	{
-		return FString();
-	}
-
-	const FPCGMetadataAttribute<FString>* Attr = static_cast<const FPCGMetadataAttribute<FString>*>(Base);
 	return Attr->GetValueFromItemKey(EntryKey);
 }
 
@@ -312,7 +287,7 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 	const float CompMinDist = FMath::Max(Settings->CompanionMinDistance, 0.0f);
 	const float CompMinDistSq = CompMinDist * CompMinDist;
 	const int32 BaseSeed = Settings->GetSeed(Context->ExecutionSource.Get());
-	const FVector WorldUp(0.0, 0.0, 1.0);
+	const FVector& WorldUp = PCGExtScatterCommon::WorldUp;
 
 	FCollisionQueryParams QueryParams;
 	QueryParams.bTraceComplex = false;
@@ -324,13 +299,14 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 	const TArray<FPCGTaggedData> CandidateInputs =
 		Context->InputData.GetInputsByPin(PCGPinConstants::DefaultInputLabel);
 
-	UPCGPointData* OutData = nullptr;
-	UPCGPointData* CompData = nullptr;
-	UPCGPointData* RejData = nullptr;
-	FPCGMetadataAttribute<FString>* MeshPathAttr = nullptr;
-
-	TArray<FVector> AcceptedPositions;   // for primary min-distance pruning
-	TArray<FVector> CompanionPositions;  // for companion min-distance pruning
+	// XY hash grids replace the old O(n²) AcceptedPositions / CompanionPositions linear
+	// scans. CellSize == query radius so the 3×3 neighbour scan is exhaustive. Grids span
+	// all input data sets (global pruning), matching the previous accumulate-across-inputs
+	// behaviour. A zero radius leaves the grid unused.
+	PCGExtScatterCommon::FMinDistGrid AcceptedGrid;
+	AcceptedGrid.CellSize = FMath::Max(MinDist, 1.0f);
+	PCGExtScatterCommon::FMinDistGrid CompanionGrid;
+	CompanionGrid.CellSize = FMath::Max(CompMinDist, 1.0f);
 
 	// Local projection lambda.
 	auto Project = [&](const FVector& XY, double RefZ, FVector& OutPos, FVector& OutNormal) -> bool
@@ -347,55 +323,69 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 			return false;
 		};
 
+	// CPU-side staging for one input data set's worth of generated points. Filled during
+	// the per-point pass, then flushed into freshly-allocated UPCGBasePointData below.
+	struct FStagedPrimary
+	{
+		FTransform Transform;
+		int32 Seed = 0;
+		float Density = 1.0f;
+		FSoftObjectPath MeshPath;
+	};
+	struct FStagedSimple
+	{
+		FTransform Transform;
+		int32 Seed = 0;
+	};
+
+	// Fold a per-input-data-set counter into per-point seeds so points sourced from
+	// different input data sets don't collide (the source point index resets per input).
+	int32 InputDataSetIndex = 0;
+
 	for (const FPCGTaggedData& Input : CandidateInputs)
 	{
-		const UPCGPointData* InData = Cast<UPCGPointData>(Input.Data);
+		const UPCGBasePointData* InData = Cast<UPCGBasePointData>(Input.Data);
 		if (!InData)
 		{
 			continue;
 		}
 
-		const TArray<FPCGPoint>& InPoints = InData->GetPoints();
-		if (InPoints.Num() == 0)
+		const int32 NumInPoints = InData->GetNumPoints();
+		if (NumInPoints == 0)
 		{
 			continue;
 		}
 
+		// Per-input-data-set salt for the seed (see staging note above).
+		const int32 InputSalt = InputDataSetIndex++;
+
 		const UPCGMetadata* InMeta = InData->ConstMetadata();
 
-		// Lazily create outputs from the first valid input (for metadata schema).
-		if (!OutData)
-		{
-			OutData = NewObject<UPCGPointData>();
-			OutData->InitializeFromData(InData);
-			UPCGMetadata* OutMeta = OutData->MutableMetadata();
-			MeshPathAttr = OutMeta->FindOrCreateAttribute<FString>(
-				Settings->MeshPathAttributeName, FString(),
-				/*bAllowInterpolation=*/false, /*bOverrideParent=*/true);
+		const TConstPCGValueRange<FTransform> InTransforms = InData->GetConstTransformValueRange();
+		const TConstPCGValueRange<int32> InSeeds = InData->GetConstSeedValueRange();
+		const TConstPCGValueRange<int64> InMetaEntries = InData->GetConstMetadataEntryValueRange();
 
-			if (Settings->bGenerateCompanions)
+		TArray<FStagedPrimary> StagedPrimaries;
+		TArray<FStagedSimple> StagedCompanions;
+		TArray<int32> RejectedReadIndices;   // source indices kept on the Rejected pin
+		TArray<FVector> RejectedPositions;    // projected position for each rejected point
+
+		// Reject helper: stage the source index + its projected position (the original
+		// node relocated the rejected copy to the projected surface point).
+		auto Reject = [&](int32 ReadIndex, const FVector& ProjPos)
 			{
-				CompData = NewObject<UPCGPointData>();
-				CompData->InitializeFromData(InData);
-			}
-			if (Settings->bOutputRejected)
-			{
-				RejData = NewObject<UPCGPointData>();
-				RejData->InitializeFromData(InData);
-			}
-		}
+				if (Settings->bOutputRejected)
+				{
+					RejectedReadIndices.Add(ReadIndex);
+					RejectedPositions.Add(ProjPos);
+				}
+			};
 
-		TArray<FPCGPoint>& OutPoints = OutData->GetMutablePoints();
-		TArray<FPCGPoint>* CompPoints = CompData ? &CompData->GetMutablePoints() : nullptr;
-		TArray<FPCGPoint>* RejPoints = RejData ? &RejData->GetMutablePoints() : nullptr;
-		UPCGMetadata* OutMeta = OutData->MutableMetadata();
-
-		for (int32 Idx = 0; Idx < InPoints.Num(); ++Idx)
+		for (int32 Idx = 0; Idx < NumInPoints; ++Idx)
 		{
-			const FPCGPoint& Cand = InPoints[Idx];
-			const FVector CandPos = Cand.Transform.GetLocation();
+			const FVector CandPos = InTransforms[Idx].GetLocation();
 
-			const int32 PointSeed = PCGHelpers::ComputeSeed(BaseSeed, Cand.Seed + Idx);
+			const int32 PointSeed = PCGHelpers::ComputeSeed(BaseSeed, InSeeds[Idx] + Idx, InputSalt);
 			FRandomStream Rng(PointSeed);
 
 			// 1. Project onto the landscape.
@@ -405,21 +395,11 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 				continue; // no surface — silently drop (not even a "reject")
 			}
 
-			auto Reject = [&]()
-				{
-					if (RejPoints)
-					{
-						FPCGPoint R = Cand;
-						R.Transform.SetLocation(ProjPos);
-						RejPoints->Add(R);
-					}
-				};
-
 			// 2. Slope band.
 			const float SlopeDot = FVector::DotProduct(Normal, WorldUp);
 			if (SlopeDot < MinSlope || SlopeDot > MaxSlope)
 			{
-				Reject();
+				Reject(Idx, ProjPos);
 				continue;
 			}
 
@@ -434,7 +414,7 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 				}
 				if (Noise < Settings->NoiseThreshold)
 				{
-					Reject();
+					Reject(Idx, ProjPos);
 					continue;
 				}
 			}
@@ -442,43 +422,28 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 			// 4. Biome response.
 			float BiomeDensity = 1.0f, BiomeScale = 1.0f;
 			ComputeBiomeFactors(Settings->BiomeResponses, Settings->BiomeCombineMode,
-				InMeta, Cand.MetadataEntry, BiomeDensity, BiomeScale);
+				InMeta, InMetaEntries[Idx], BiomeDensity, BiomeScale);
 
 			// 6. Density roll.
+			// TODO(audit): noise is applied twice -- once as the hard gate in step 3, and
+			// again here as a multiplier into the keep probability. Confirm with the owner
+			// whether the second application is intentional (left unchanged for now).
 			const float Keep = FMath::Clamp(
 				Settings->KeepProbability * Noise * BiomeDensity, 0.0f, 1.0f);
 			if (Rng.FRand() > Keep)
 			{
-				Reject();
+				Reject(Idx, ProjPos);
 				continue;
 			}
 
 			// 7. Min-distance prune.
-			if (MinDist > 0.0f)
+			if (MinDist > 0.0f && AcceptedGrid.HasWithin(ProjPos, MinDistSq))
 			{
-				bool bTooClose = false;
-				for (const FVector& P : AcceptedPositions)
-				{
-					if (FVector::DistSquared(ProjPos, P) < MinDistSq)
-					{
-						bTooClose = true;
-						break;
-					}
-				}
-				if (bTooClose)
-				{
-					Reject();
-					continue;
-				}
+				Reject(Idx, ProjPos);
+				continue;
 			}
 
 			// 8. Build the instance.
-			FPCGPoint NewPoint;
-			NewPoint.Seed = PointSeed;
-			NewPoint.Density = Keep;
-			NewPoint.Steepness = 1.0f;
-			NewPoint.SetExtents(FVector(50.0f));
-
 			const int32 MeshIdx = SelectMeshIndex(MeshCache, MeshTotalWeight, Rng);
 			const FVegMeshCache& Chosen = MeshCache[MeshIdx];
 
@@ -497,21 +462,22 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 				Settings->SlopeAlignAmount, Settings->MaxAlignAngleDeg, JitterP, JitterR);
 
 			const FVector FinalPos = ProjPos + FVector(0.0, 0.0, Settings->ZOffset);
-			NewPoint.Transform = FTransform(Rot, FinalPos, FVector(FinalScale));
 
-			// Write the mesh path attribute on a fresh metadata entry.
-			NewPoint.MetadataEntry = PCGInvalidEntryKey;
-			OutMeta->InitializeOnSet(NewPoint.MetadataEntry);
-			if (MeshPathAttr)
-			{
-				MeshPathAttr->SetValue(NewPoint.MetadataEntry, Chosen.MeshPath.ToString());
-			}
+			FStagedPrimary Primary;
+			Primary.Transform = FTransform(Rot, FinalPos, FVector(FinalScale));
+			Primary.Seed = PointSeed;
+			Primary.Density = Keep;
+			Primary.MeshPath = Chosen.MeshPath;
+			StagedPrimaries.Add(Primary);
 
-			OutPoints.Add(NewPoint);
-			AcceptedPositions.Add(ProjPos);
+			AcceptedGrid.Add(ProjPos);
 
 			// 9. Companions.
-			if (Settings->bGenerateCompanions && CompPoints)
+			// TODO(audit): companion rings use a uniform radius distribution (Radius drawn
+			// linearly in [RMin,RMax]) which clumps toward the centre, and they only avoid
+			// other companions -- they don't avoid primary instances. Owner may want area-
+			// uniform radial sampling and primary-avoidance. Left unchanged for now.
+			if (Settings->bGenerateCompanions)
 			{
 				const int32 NComp = Rng.RandRange(
 					FMath::Min(Settings->CompanionsPerPrimaryMin, Settings->CompanionsPerPrimaryMax),
@@ -541,72 +507,138 @@ bool FPCGTieredVegetationScatterElement::ExecuteInternal(FPCGContext* Context) c
 						continue;
 					}
 
-					//if (Exclusions.Num() > 0 &&
-					//	ExclusionFactorAt(Exclusions, FVector2D(CompPos.X, CompPos.Y),
-					//		Settings->ExclusionFalloffDistance) <= 0.0f)
-					//{
-					//	continue;
-					//}
-
-					if (CompMinDist > 0.0f)
+					if (CompMinDist > 0.0f && CompanionGrid.HasWithin(CompPos, CompMinDistSq))
 					{
-						bool bClose = false;
-						for (const FVector& P : CompanionPositions)
-						{
-							if (FVector::DistSquared(CompPos, P) < CompMinDistSq)
-							{
-								bClose = true;
-								break;
-							}
-						}
-						if (bClose)
-						{
-							continue;
-						}
+						continue;
 					}
 
-					FPCGPoint Comp;
-					Comp.Seed = PCGHelpers::ComputeSeed(PointSeed, c + 1);
-					Comp.Density = 1.0f;
-					Comp.Steepness = 1.0f;
-					Comp.SetExtents(FVector(30.0f));
-
-					FRandomStream CompRng(Comp.Seed);
+					const int32 CompSeed = PCGHelpers::ComputeSeed(PointSeed, c + 1);
+					FRandomStream CompRng(CompSeed);
 					const float CompScale = CompRng.FRandRange(
 						Settings->CompanionScaleRange.X, Settings->CompanionScaleRange.Y);
 					const float CYaw = Settings->bRandomYaw ? CompRng.FRandRange(0.0f, 360.0f) : 0.0f;
 					const FQuat CRot = MakeFoliageRotation(CompNormal, CYaw,
 						Settings->SlopeAlignAmount, Settings->MaxAlignAngleDeg, 0.0f, 0.0f);
 
+					FStagedSimple Comp;
 					Comp.Transform = FTransform(CRot,
 						CompPos + FVector(0.0, 0.0, Settings->CompanionZOffset),
 						FVector(CompScale));
+					Comp.Seed = CompSeed;
+					StagedCompanions.Add(Comp);
 
-					CompPoints->Add(Comp);
-					CompanionPositions.Add(CompPos);
+					CompanionGrid.Add(CompPos);
 				}
 			}
 		}
-	}
 
-	// ── Emit ──
-	if (OutData && OutData->GetPoints().Num() > 0)
-	{
-		FPCGTaggedData& T = Outputs.Emplace_GetRef();
-		T.Data = OutData;
-		T.Pin = PCGPinConstants::DefaultOutputLabel;
-	}
-	if (CompData && CompData->GetPoints().Num() > 0)
-	{
-		FPCGTaggedData& T = Outputs.Emplace_GetRef();
-		T.Data = CompData;
-		T.Pin = CompanionsLabel;
-	}
-	if (RejData && RejData->GetPoints().Num() > 0)
-	{
-		FPCGTaggedData& T = Outputs.Emplace_GetRef();
-		T.Data = RejData;
-		T.Pin = RejectedLabel;
+		// ── Flush this input data set's staged points into output point data ──
+
+		// Default output: generated primaries (transform/seed/density + MeshPath attr).
+		if (StagedPrimaries.Num() > 0)
+		{
+			UPCGBasePointData* OutData = FPCGContext::NewPointData_AnyThread(Context);
+			FPCGInitializeFromDataParams InitParams(InData);
+			OutData->InitializeFromDataWithParams(InitParams);
+			OutData->SetNumPoints(StagedPrimaries.Num(), /*bInitializeValues=*/false);
+			OutData->AllocateProperties(
+				EPCGPointNativeProperties::Transform | EPCGPointNativeProperties::Seed |
+				EPCGPointNativeProperties::Density | EPCGPointNativeProperties::Steepness |
+				EPCGPointNativeProperties::BoundsMin | EPCGPointNativeProperties::BoundsMax |
+				EPCGPointNativeProperties::MetadataEntry);
+			OutData->SetSteepness(1.0f);
+			OutData->SetExtents(FVector(50.0f));
+
+			UPCGMetadata* OutMeta = OutData->MutableMetadata();
+			OutMeta->CreateSoftObjectPathAttribute(
+				Settings->MeshPathAttributeName, FSoftObjectPath(), /*bAllowsInterpolation=*/false);
+			FPCGMetadataAttribute<FSoftObjectPath>* MeshPathAttr =
+				OutMeta->GetMutableTypedAttribute<FSoftObjectPath>(Settings->MeshPathAttributeName);
+
+			TPCGValueRange<FTransform> Transforms = OutData->GetTransformValueRange();
+			TPCGValueRange<int32> Seeds = OutData->GetSeedValueRange();
+			TPCGValueRange<float> Densities = OutData->GetDensityValueRange();
+			TPCGValueRange<int64> MetaEntries = OutData->GetMetadataEntryValueRange();
+
+			for (int32 i = 0; i < StagedPrimaries.Num(); ++i)
+			{
+				const FStagedPrimary& P = StagedPrimaries[i];
+				Transforms[i] = P.Transform;
+				Seeds[i] = P.Seed;
+				Densities[i] = P.Density;
+
+				MetaEntries[i] = PCGInvalidEntryKey;
+				OutMeta->InitializeOnSet(MetaEntries[i]);
+				if (MeshPathAttr)
+				{
+					MeshPathAttr->SetValue(MetaEntries[i], P.MeshPath);
+				}
+			}
+
+			FPCGTaggedData& T = Outputs.Emplace_GetRef();
+			T.Data = OutData;
+			T.Pin = PCGPinConstants::DefaultOutputLabel;
+		}
+
+		// Companions output: transform-ready, mesh-less understory points.
+		if (Settings->bGenerateCompanions && StagedCompanions.Num() > 0)
+		{
+			UPCGBasePointData* CompData = FPCGContext::NewPointData_AnyThread(Context);
+			FPCGInitializeFromDataParams InitParams(InData);
+			CompData->InitializeFromDataWithParams(InitParams);
+			CompData->SetNumPoints(StagedCompanions.Num(), /*bInitializeValues=*/false);
+			CompData->AllocateProperties(
+				EPCGPointNativeProperties::Transform | EPCGPointNativeProperties::Seed |
+				EPCGPointNativeProperties::Density | EPCGPointNativeProperties::Steepness |
+				EPCGPointNativeProperties::BoundsMin | EPCGPointNativeProperties::BoundsMax);
+			CompData->SetDensity(1.0f);
+			CompData->SetSteepness(1.0f);
+			CompData->SetExtents(FVector(30.0f));
+
+			TPCGValueRange<FTransform> Transforms = CompData->GetTransformValueRange();
+			TPCGValueRange<int32> Seeds = CompData->GetSeedValueRange();
+
+			for (int32 i = 0; i < StagedCompanions.Num(); ++i)
+			{
+				Transforms[i] = StagedCompanions[i].Transform;
+				Seeds[i] = StagedCompanions[i].Seed;
+			}
+
+			FPCGTaggedData& T = Outputs.Emplace_GetRef();
+			T.Data = CompData;
+			T.Pin = PCGExtScatterCommon::CompanionsPinLabel;
+		}
+
+		// Rejected output: culled candidates copied 1:1 from the source then relocated to
+		// their projected surface position (debug only).
+		if (Settings->bOutputRejected && RejectedReadIndices.Num() > 0)
+		{
+			UPCGBasePointData* RejData = FPCGContext::NewPointData_AnyThread(Context);
+			FPCGInitializeFromDataParams InitParams(InData);
+			RejData->InitializeFromDataWithParams(InitParams);
+			RejData->SetNumPoints(RejectedReadIndices.Num(), /*bInitializeValues=*/false);
+			RejData->AllocateProperties(InData->GetAllocatedProperties());
+
+			TArray<int32> WriteIndices;
+			WriteIndices.SetNumUninitialized(RejectedReadIndices.Num());
+			for (int32 i = 0; i < WriteIndices.Num(); ++i)
+			{
+				WriteIndices[i] = i;
+			}
+			InData->CopyPropertiesTo(RejData, RejectedReadIndices, WriteIndices,
+				InData->GetAllocatedProperties());
+
+			// Relocate to the projected surface point (matching the original behaviour).
+			TPCGValueRange<FTransform> Transforms = RejData->GetTransformValueRange();
+			for (int32 i = 0; i < RejectedPositions.Num(); ++i)
+			{
+				Transforms[i].SetLocation(RejectedPositions[i]);
+			}
+
+			FPCGTaggedData& T = Outputs.Emplace_GetRef();
+			T.Data = RejData;
+			T.Pin = PCGExtScatterCommon::RejectedPinLabel;
+		}
 	}
 
 	return true;

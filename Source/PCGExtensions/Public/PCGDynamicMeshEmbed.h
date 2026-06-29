@@ -10,7 +10,10 @@
 #include "CoreMinimal.h"
 #include "PCGSettings.h"
 #include "PCGElement.h"
+#include "PCGContext.h"
+#include "Async/PCGAsyncLoadingContext.h"
 #include "Engine/StaticMesh.h"
+#include "PCGExtScatterCommon.h"
 
 #include "PCGDynamicMeshEmbed.generated.h"
 
@@ -29,18 +32,6 @@ struct PCGEXTENSIONS_API FPCGEmbedMeshEntry
 	/** Relative probability of this mesh being selected. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (ClampMin = "0.01"))
 	float Weight = 1.0f;
-};
-
-/**
- * Cached bounding box data extracted from a loaded static mesh.
- * Stored once at execution start to avoid repeated mesh lookups.
- */
-struct FPCGMeshBoundsCache
-{
-	FSoftObjectPath MeshPath;
-	FVector BoundsMin = FVector::ZeroVector;  // Local-space min (e.g. -HalfX, -HalfY, 0 for base pivot)
-	FVector BoundsMax = FVector::ZeroVector;  // Local-space max (e.g. +HalfX, +HalfY, +Height)
-	float CumulativeWeight = 0.0f;           // For weighted random selection
 };
 
 // ─────────────────────────────────────────────
@@ -114,18 +105,49 @@ public:
 	 * Attribute name where the assigned mesh path is stored on each output point.
 	 * The downstream Static Mesh Spawner should use Mesh Selector: "By Attribute"
 	 * and reference this attribute name.
+	 *
+	 * NOTE: as of the 5.8 migration this is created as a SoftObjectPath attribute
+	 * (not a String) so the Static Mesh Spawner consumes it natively.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
 	FName MeshPathAttributeName = FName(TEXT("MeshPath"));
+
+	/** By default mesh loading is asynchronous; force synchronous if a downstream step needs it immediately. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Settings|Debug")
+	bool bSynchronousLoad = false;
 };
 
 // ─────────────────────────────────
 //  Element (executes the node logic)
 // ─────────────────────────────────
 
-class PCGEXTENSIONS_API FPCGDynamicMeshEmbedElement : public IPCGElement
+/**
+ * Context carries the async-loading state (streamable handle + loaded refs) plus the
+ * mesh bounds resolved on the game thread during PrepareData. ExecuteInternal then runs
+ * on a worker thread and only reads MeshCache -- it never touches a UStaticMesh.
+ */
+struct FPCGDynamicMeshEmbedContext : public FPCGContext, public IPCGAsyncLoadingContext
 {
+	TArray<PCGExtScatterCommon::FMeshBoundsCache> MeshCache;
+	float TotalWeight = 0.0f;
+	bool bCacheBuilt = false;
+};
+
+class PCGEXTENSIONS_API FPCGDynamicMeshEmbedElement
+	: public IPCGElementWithCustomContext<FPCGDynamicMeshEmbedContext>
+{
+public:
+	// Only the PrepareData phase (resource loading + reading UStaticMesh bounds) must run
+	// on the main thread. The Execute phase is thread-safe and runs on workers.
+	// (Context is null when the scheduler probes context-creation affinity -- allow workers then.)
+	virtual bool CanExecuteOnlyOnMainThread(FPCGContext* Context) const override
+	{
+		return Context && Context->CurrentPhase == EPCGExecutionPhase::PrepareData;
+	}
+
 protected:
+	virtual bool SupportsBasePointDataInputs(FPCGContext* InContext) const override { return true; }
+	virtual bool PrepareDataInternal(FPCGContext* Context) const override;
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;
 
 private:

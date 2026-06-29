@@ -9,7 +9,10 @@
 #include "CoreMinimal.h"
 #include "PCGSettings.h"
 #include "PCGElement.h"
+#include "PCGContext.h"
+#include "Async/PCGAsyncLoadingContext.h"
 #include "Engine/StaticMesh.h"
+#include "PCGExtScatterCommon.h"
 
 #include "PCGRockFormationGenerator.generated.h"
 
@@ -124,6 +127,7 @@ struct PCGEXTENSIONS_API FFormationPlacedRock
 	FSoftObjectPath MeshPath;
 	int32 Tier = 0;
 	bool bIsFillRock = false;
+	int32 Seed = 0;  // Resolved per-output-point seed (assigned at conversion time)
 
 	/** Get the world-space AABB top Z (approximate, ignoring rotation for speed). */
 	float GetWorldTopZ() const
@@ -138,6 +142,10 @@ struct PCGEXTENSIONS_API FFormationPlacedRock
 	}
 
 	/** Get the world-space horizontal half-extents. */
+	// TODO(audit): max(|min|,|max|) overestimates the half-extent for asymmetric
+	// pivots (e.g. base-centre meshes where |min| != |max|). Correct form is the
+	// true half-size (max-min)/2, with the box centred on Position + (max+min)/2.
+	// Left as-is for now to avoid changing overhang detection / fill placement.
 	float GetWorldHalfExtentX() const { return FMath::Max(FMath::Abs(BoundsMax.X), FMath::Abs(BoundsMin.X)) * Scale.X; }
 	float GetWorldHalfExtentY() const { return FMath::Max(FMath::Abs(BoundsMax.Y), FMath::Abs(BoundsMin.Y)) * Scale.Y; }
 
@@ -152,14 +160,6 @@ struct PCGEXTENSIONS_API FFormationPlacedRock
 };
 
 // Cached mesh data
-struct PCGEXTENSIONS_API FFormationMeshCache
-{
-	FSoftObjectPath MeshPath;
-	FVector BoundsMin = FVector::ZeroVector;
-	FVector BoundsMax = FVector::ZeroVector;
-	float CumulativeWeight = 0.0f;
-};
-
 // ─────────────────────────────────────────────
 //  Settings
 // ─────────────────────────────────────────────
@@ -281,34 +281,58 @@ public:
 	/** Attribute name for the fill rock flag. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Output")
 	FName FillFlagAttributeName = FName(TEXT("bIsFillRock"));
+
+	/** By default mesh loading is asynchronous; force synchronous if a downstream step needs it immediately. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Settings|Debug")
+	bool bSynchronousLoad = false;
 };
 
 // ─────────────────────────────────────────────
 //  Element
 // ─────────────────────────────────────────────
 
-class PCGEXTENSIONS_API FPCGRockFormationGeneratorElement : public IPCGElement
+/**
+ * Context carries the async-loading state (streamable handle + loaded refs) plus the
+ * per-tier mesh bounds resolved on the game thread during PrepareData. ExecuteInternal then
+ * runs on a worker thread and only reads these caches -- it never touches a UStaticMesh.
+ */
+struct FPCGRockFormationGeneratorContext : public FPCGContext, public IPCGAsyncLoadingContext
 {
+	TArray<PCGExtScatterCommon::FMeshBoundsCache> FoundationCache, Tier1Cache, Tier2Cache;
+	float FoundationTotalWeight = 0, Tier1TotalWeight = 0, Tier2TotalWeight = 0;
+	bool bHasTier1 = false, bHasTier2 = false;
+	bool bCacheBuilt = false;
+};
+
+class PCGEXTENSIONS_API FPCGRockFormationGeneratorElement
+	: public IPCGElementWithCustomContext<FPCGRockFormationGeneratorContext>
+{
+public:
+	// Only the PrepareData phase (resource loading + reading UStaticMesh bounds via
+	// GetBoundingBox) must run on the main thread. The Execute phase is thread-safe and runs
+	// on workers -- it only reads the bounds caches resolved during PrepareData.
+	// (Context is null when the scheduler probes context-creation affinity -- allow workers then.)
+	virtual bool CanExecuteOnlyOnMainThread(FPCGContext* Context) const override
+	{
+		return Context && Context->CurrentPhase == EPCGExecutionPhase::PrepareData;
+	}
+
 protected:
+	virtual bool SupportsBasePointDataInputs(FPCGContext* InContext) const override { return true; }
+	virtual bool PrepareDataInternal(FPCGContext* Context) const override;
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;
 
 private:
-	/** Load meshes for a tier and cache bounding boxes. */
-	static bool CacheTierMeshes(
-		const TArray<FPCGFormationMeshEntry>& Entries,
-		TArray<FFormationMeshCache>& OutCache,
-		float& OutTotalWeight);
-
 	/** Select a random mesh from a cached tier. */
-	static const FFormationMeshCache& SelectRandomMesh(
-		const TArray<FFormationMeshCache>& Cache,
+	static const PCGExtScatterCommon::FMeshBoundsCache& SelectRandomMesh(
+		const TArray<PCGExtScatterCommon::FMeshBoundsCache>& Cache,
 		float TotalWeight,
 		FRandomStream& Rng);
 
 	/** Generate tier N rocks around parent rocks. */
 	static void GenerateTierRocks(
 		const FPCGFormationTierConfig& Config,
-		const TArray<FFormationMeshCache>& MeshCache,
+		const TArray<PCGExtScatterCommon::FMeshBoundsCache>& MeshCache,
 		float MeshTotalWeight,
 		const TArray<FFormationPlacedRock>& ParentRocks,
 		const FVector& FormationCentre,
@@ -323,7 +347,7 @@ private:
 		float OverhangTolerance,
 		int32 MaxFillsPerRock,
 		float FillScaleMultiplier,
-		const TArray<FFormationMeshCache>& FillMeshCache,
+		const TArray<PCGExtScatterCommon::FMeshBoundsCache>& FillMeshCache,
 		float FillMeshTotalWeight,
 		int32 FillTierIndex,
 		int32 TargetTierIndex,
