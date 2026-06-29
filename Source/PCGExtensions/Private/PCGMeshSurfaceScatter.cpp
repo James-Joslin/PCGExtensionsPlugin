@@ -5,12 +5,13 @@
 #include "PCGMeshSurfaceScatter.h"
 
 #include "PCGContext.h"
-#include "PCGPoint.h"
-#include "Data/PCGPointData.h"
+#include "Data/PCGBasePointData.h"
 #include "Data/PCGSpatialData.h"
 #include "Metadata/PCGMetadata.h"
 #include "Metadata/PCGMetadataAttribute.h"
 #include "Helpers/PCGHelpers.h"
+#include "Async/PCGAsyncLoadingContext.h"
+#include "PCGExtScatterCommon.h"
 #include "Engine/World.h"
 #include "Engine/StaticMesh.h"
 #include "StaticMeshResources.h"
@@ -22,48 +23,15 @@
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(PCGMeshSurfaceScatter)
 
-namespace
+// Shared scatter helpers (FMinDistGrid / WorldUp / RejectedPinLabel) live in
+// PCGExtScatterCommon.h -- see PCGExtScatterCommon::* below. FDistEntry and the
+// SqCmToSqM constant are unique to this node; they sit in a file-named namespace
+// (rather than an anonymous one) so the UBT Unity build can't collide them with a
+// same-named helper in a sibling .cpp concatenated into the same translation unit.
+namespace PCGMeshSurfaceScatter
 {
-	const FName RejectedLabel(TEXT("Rejected"));
-	const FVector WorldUp(0.0, 0.0, 1.0);
-
 	// Square-centimetre → square-metre conversion (UU are cm in UE).
 	constexpr double SqCmToSqM = 1.0 / (100.0 * 100.0);
-
-	// ── Uniform XY hash grid for min-distance pruning (same as GroundCoverScatter). ──
-	struct FMinDistGrid
-	{
-		float CellSize = 100.0f;
-		TMap<FIntPoint, TArray<FVector>> Cells;
-
-		FORCEINLINE FIntPoint CellOf(const FVector& P) const
-		{
-			return FIntPoint(FMath::FloorToInt(P.X / CellSize), FMath::FloorToInt(P.Y / CellSize));
-		}
-		FORCEINLINE void Add(const FVector& P) { Cells.FindOrAdd(CellOf(P)).Add(P); }
-
-		bool HasWithin(const FVector& P, float RadiusSq) const
-		{
-			const FIntPoint C = CellOf(P);
-			for (int32 dx = -1; dx <= 1; ++dx)
-			{
-				for (int32 dy = -1; dy <= 1; ++dy)
-				{
-					if (const TArray<FVector>* Arr = Cells.Find(FIntPoint(C.X + dx, C.Y + dy)))
-					{
-						for (const FVector& Q : *Arr)
-						{
-							if (FVector::DistSquared(P, Q) < RadiusSq)
-							{
-								return true;
-							}
-						}
-					}
-				}
-			}
-			return false;
-		}
-	};
 
 	// Priority-queue entry for Dijkstra-style BFS.
 	struct FDistEntry
@@ -111,7 +79,7 @@ TArray<FPCGPinProperties> UPCGMeshSurfaceScatterSettings::OutputPinProperties() 
 			"Grass/foliage instances on rock surfaces with MeshPath attribute. "
 			"Feed a By-Attribute Static Mesh Spawner."));
 
-	Pins.Emplace(RejectedLabel,
+	Pins.Emplace(PCGExtScatterCommon::RejectedPinLabel,
 		EPCGDataType::Point,
 		/*bAllowMultipleConnections=*/true,
 		/*bAllowMultipleData=*/true,
@@ -139,7 +107,8 @@ bool FPCGMeshSurfaceScatterElement::BuildGrassMeshCache(
 
 	for (const FPCGSurfGrassMeshEntry& Entry : Entries)
 	{
-		UStaticMesh* Loaded = Entry.Mesh.LoadSynchronous();
+		// Resident after PrepareDataInternal's async load -- never sync-loads off-thread.
+		UStaticMesh* Loaded = Entry.Mesh.Get();
 		if (!Loaded)
 		{
 			continue;
@@ -179,12 +148,13 @@ FString FPCGMeshSurfaceScatterElement::ReadStringAttr(
 	{
 		return FString();
 	}
-	const FPCGMetadataAttributeBase* Base = Meta->GetConstAttribute(Name);
-	if (!Base || Base->GetTypeId() != PCG::Private::MetadataTypes<FString>::Id)
+	// GetConstTypedAttribute returns null on a type mismatch, so we avoid the
+	// PCG::Private::MetadataTypes<T>::Id comparison entirely.
+	const FPCGMetadataAttribute<FString>* Attr = Meta->GetConstTypedAttribute<FString>(Name);
+	if (!Attr)
 	{
 		return FString();
 	}
-	const auto* Attr = static_cast<const FPCGMetadataAttribute<FString>*>(Base);
 	return Attr->GetValueFromItemKey(EntryKey);
 }
 
@@ -264,10 +234,14 @@ bool FPCGMeshSurfaceScatterElement::BuildTopology(
 		const float CrossLen = Cross.Size();
 		Tri.Area = CrossLen * 0.5f;
 		Tri.Normal = (CrossLen > KINDA_SMALL_NUMBER) ? (Cross / CrossLen) : FVector::UpVector;
-		Tri.DotUp = FVector::DotProduct(Tri.Normal, WorldUp);
+		Tri.DotUp = FVector::DotProduct(Tri.Normal, PCGExtScatterCommon::WorldUp);
 
 		// Accept both winding directions — the "up" face is whichever has a positive DotUp.
 		// If the mesh has inverted winding, the normal points down; use the flipped version.
+		// TODO(audit): this unconditional flip also treats overhang undersides (true
+		// downward-facing faces) as walkable up-faces, so grass can be placed on the
+		// underside of overhangs. Decide whether to flip only for inverted-winding
+		// meshes (e.g. via mesh winding/orientation) or to keep the current behaviour.
 		if (Tri.DotUp < 0.0f)
 		{
 			Tri.Normal = -Tri.Normal;
@@ -369,7 +343,7 @@ bool FPCGMeshSurfaceScatterElement::BuildTopology(
 
 	// Identify boundary-adjacent walkable triangles: those sharing an edge with a
 	// non-walkable triangle or a mesh-boundary edge (only 1 triangle on the edge).
-	TArray<FDistEntry> Heap;
+	TArray<PCGMeshSurfaceScatter::FDistEntry> Heap;
 	for (int32 T = 0; T < NumTris; ++T)
 	{
 		if (!OutTris[T].bWalkable)
@@ -421,7 +395,7 @@ bool FPCGMeshSurfaceScatterElement::BuildTopology(
 
 	while (Heap.Num() > 0)
 	{
-		FDistEntry Current;
+		PCGMeshSurfaceScatter::FDistEntry Current;
 		Heap.HeapPop(Current);
 
 		if (Current.Dist > OutTris[Current.TriIdx].EdgeDist)
@@ -454,11 +428,11 @@ FQuat FPCGMeshSurfaceScatterElement::MakeSurfaceRotation(
 	float JitterPitchDeg, float JitterRollDeg)
 {
 	const FVector N = SurfaceNormal.GetSafeNormal();
-	FVector DesiredUp = WorldUp;
+	FVector DesiredUp = PCGExtScatterCommon::WorldUp;
 
 	if (AlignAmount > 0.0f)
 	{
-		const float NDot = FMath::Clamp(FVector::DotProduct(WorldUp, N), -1.0f, 1.0f);
+		const float NDot = FMath::Clamp(FVector::DotProduct(PCGExtScatterCommon::WorldUp, N), -1.0f, 1.0f);
 		const float FullAngle = FMath::Acos(NDot);
 		if (FullAngle > KINDA_SMALL_NUMBER)
 		{
@@ -468,11 +442,11 @@ FQuat FPCGMeshSurfaceScatterElement::MakeSurfaceRotation(
 			{
 				Alpha = MaxRad / FullAngle;
 			}
-			DesiredUp = FMath::Lerp(WorldUp, N, Alpha).GetSafeNormal();
+			DesiredUp = FMath::Lerp(PCGExtScatterCommon::WorldUp, N, Alpha).GetSafeNormal();
 		}
 	}
 
-	const FQuat AlignQuat = FQuat::FindBetweenNormals(WorldUp, DesiredUp);
+	const FQuat AlignQuat = FQuat::FindBetweenNormals(PCGExtScatterCommon::WorldUp, DesiredUp);
 	const FQuat YawQuat(DesiredUp, FMath::DegreesToRadians(YawDeg));
 	const FQuat JitterQuat = FRotator(JitterPitchDeg, 0.0f, JitterRollDeg).Quaternion();
 
@@ -490,6 +464,140 @@ FVector FPCGMeshSurfaceScatterElement::RandomBarycentric(FRandomStream& Rng)
 	const float V = Rng.FRand();
 	const float SqU = FMath::Sqrt(U);
 	return FVector(1.0f - SqU, SqU * (1.0f - V), SqU * V);
+}
+
+// ─────────────────────────────────────────────
+//  Element -- Async resource loading
+// ─────────────────────────────────────────────
+
+bool FPCGMeshSurfaceScatterElement::PrepareDataInternal(FPCGContext* Context) const
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(FPCGMeshSurfaceScatterElement::PrepareData);
+
+	const UPCGMeshSurfaceScatterSettings* Settings =
+		Context->GetInputSettings<UPCGMeshSurfaceScatterSettings>();
+	check(Settings);
+
+	FPCGMeshSurfaceScatterContext* ThisContext = static_cast<FPCGMeshSurfaceScatterContext*>(Context);
+
+	// Determine whether the In pin carries point data -- this gates both the per-point
+	// rock-mesh gather (below) and the actor-tag fallback discovery. Reading input via
+	// ToBasePointData here mirrors what ExecuteInternal does, so the two phases agree.
+	const TArray<FPCGTaggedData> Inputs =
+		Context->InputData.GetInputsByPin(PCGPinConstants::DefaultInputLabel);
+
+	bool bHasInputPin = false;
+
+	if (!ThisContext->WasLoadRequested())
+	{
+		TArray<FSoftObjectPath> ToLoad;
+
+		// (i) Static grass sets -- both the main and the landscape-projected variants.
+		auto GatherSet = [&ToLoad](const TArray<FPCGSurfGrassMeshEntry>& Entries)
+			{
+				for (const FPCGSurfGrassMeshEntry& Entry : Entries)
+				{
+					if (!Entry.Mesh.IsNull())
+					{
+						ToLoad.AddUnique(Entry.Mesh.ToSoftObjectPath());
+					}
+				}
+			};
+		GatherSet(Settings->GrassMeshSet);
+		GatherSet(Settings->LandscapeGrassMeshSet);
+
+		// (ii) Data-dependent rock meshes -- one soft path per input point's
+		//      SourceMeshPathAttribute. Mirrors the Static Mesh Spawner's
+		//      "by attribute" gather (PCGStaticMeshSpawner.cpp ~601).
+		for (const FPCGTaggedData& Tagged : Inputs)
+		{
+			const UPCGSpatialData* SpatialData = Cast<UPCGSpatialData>(Tagged.Data);
+			if (!SpatialData)
+			{
+				continue;
+			}
+			const UPCGBasePointData* PtData = SpatialData->ToBasePointData(Context);
+			if (!PtData)
+			{
+				continue;
+			}
+			const int32 NumPoints = PtData->GetNumPoints();
+			if (NumPoints == 0)
+			{
+				continue;
+			}
+			bHasInputPin = true;
+
+			const UPCGMetadata* Meta = PtData->ConstMetadata();
+			const TConstPCGValueRange<int64> MetadataEntryRange = PtData->GetConstMetadataEntryValueRange();
+
+			for (int32 PointIdx = 0; PointIdx < NumPoints; ++PointIdx)
+			{
+				const FString MeshPath = ReadStringAttr(Meta, Settings->SourceMeshPathAttribute, MetadataEntryRange[PointIdx]);
+				if (MeshPath.IsEmpty())
+				{
+					continue;
+				}
+				ToLoad.AddUnique(FSoftObjectPath(MeshPath));
+			}
+		}
+
+		// (iii) Actor-tag fallback discovery -- GAME-THREAD-ONLY. When there's no input-pin
+		//       data, walk the world for tagged actors' StaticMeshComponents. TActorIterator
+		//       must not run off the game thread, so the discovery happens here in PrepareData
+		//       and the results are cached on the context for ExecuteInternal to consume.
+		if (!bHasInputPin && !Settings->ActorTagFallback.IsNone() && !ThisContext->bFallbackGathered)
+		{
+			UWorld* World = nullptr;
+			if (UObject* SourceObj = Context->ExecutionSource.GetObject())
+			{
+				World = SourceObj->GetWorld();
+			}
+
+			if (World)
+			{
+				for (TActorIterator<AActor> It(World); It; ++It)
+				{
+					AActor* Actor = *It;
+					if (!Actor->ActorHasTag(Settings->ActorTagFallback))
+					{
+						continue;
+					}
+					TArray<UStaticMeshComponent*> SMCs;
+					Actor->GetComponents<UStaticMeshComponent>(SMCs);
+					for (UStaticMeshComponent* SMC : SMCs)
+					{
+						UStaticMesh* Mesh = SMC->GetStaticMesh();
+						if (!Mesh)
+						{
+							continue;
+						}
+						FPCGMeshSurfaceScatterContext::FFallbackRock Rock;
+						Rock.Mesh = Mesh;
+						Rock.WorldTransform = SMC->GetComponentTransform();
+						ThisContext->FallbackRocks.Add(Rock);
+
+						// Defensive: these meshes are referenced by a spawned component so they
+						// are already resident, but add their soft paths to the load set so the
+						// streamable handle keeps them alive through Execute.
+						ToLoad.AddUnique(FSoftObjectPath(Mesh));
+					}
+				}
+			}
+
+			ThisContext->bFallbackGathered = true;
+		}
+
+		// Async load suspends the task (returns false) until streaming completes; the context
+		// holds the streamable handle so the meshes (grass + rocks) stay resident through
+		// Execute. A synchronous load returns true immediately.
+		if (!ThisContext->RequestResourceLoad(ThisContext, MoveTemp(ToLoad), !Settings->bSynchronousLoad))
+		{
+			return false;
+		}
+	}
+
+	return true;
 }
 
 // ─────────────────────────────────────────────
@@ -512,7 +620,7 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 	}
 	if (!World)
 	{
-		PCGE_LOG(Error, GraphAndLog, NSLOCTEXT("PCGMeshSurfaceScatter", "NoWorld",
+		PCGE_LOG_C(Error, GraphAndLog, Context, NSLOCTEXT("PCGMeshSurfaceScatter", "NoWorld",
 			"Mesh Surface Scatter: Could not get UWorld."));
 		return true;
 	}
@@ -522,7 +630,7 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 	float GrassTotalWeight = 0.0f;
 	if (!BuildGrassMeshCache(Settings->GrassMeshSet, GrassCache, GrassTotalWeight))
 	{
-		PCGE_LOG(Error, GraphAndLog, NSLOCTEXT("PCGMeshSurfaceScatter", "NoGrassMesh",
+		PCGE_LOG_C(Error, GraphAndLog, Context, NSLOCTEXT("PCGMeshSurfaceScatter", "NoGrassMesh",
 			"Mesh Surface Scatter: No valid grass meshes configured."));
 		return true;
 	}
@@ -549,94 +657,97 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 	bool bHasInputPin = false;
 	for (const FPCGTaggedData& Tagged : Inputs)
 	{
-		// Use ToPointData() instead of Cast<UPCGPointData> — rock graph outputs
+		// Use ToBasePointData() instead of Cast<UPCGBasePointData> -- rock graph outputs
 		// may arrive as composite/union data that silently fails a direct cast.
 		const UPCGSpatialData* SpatialData = Cast<UPCGSpatialData>(Tagged.Data);
 		if (!SpatialData)
 		{
 			continue;
 		}
-		const UPCGPointData* PtData = SpatialData->ToPointData(Context);
+		const UPCGBasePointData* PtData = SpatialData->ToBasePointData(Context);
 		if (!PtData)
 		{
 			continue;
 		}
-		const TArray<FPCGPoint>& Points = PtData->GetPoints();
-		if (Points.Num() == 0)
+		const int32 NumPoints = PtData->GetNumPoints();
+		if (NumPoints == 0)
 		{
 			continue;
 		}
 		bHasInputPin = true;
 		const UPCGMetadata* Meta = PtData->ConstMetadata();
 
-		for (const FPCGPoint& P : Points)
+		const TConstPCGValueRange<FTransform> TransformRange = PtData->GetConstTransformValueRange();
+		const TConstPCGValueRange<int32> SeedRange = PtData->GetConstSeedValueRange();
+		const TConstPCGValueRange<int64> MetadataEntryRange = PtData->GetConstMetadataEntryValueRange();
+
+		for (int32 PointIdx = 0; PointIdx < NumPoints; ++PointIdx)
 		{
-			const FString MeshPath = ReadStringAttr(Meta, Settings->SourceMeshPathAttribute, P.MetadataEntry);
+			const FString MeshPath = ReadStringAttr(Meta, Settings->SourceMeshPathAttribute, MetadataEntryRange[PointIdx]);
 			if (MeshPath.IsEmpty())
 			{
 				continue;
 			}
-			UStaticMesh* Mesh = Cast<UStaticMesh>(FSoftObjectPath(MeshPath).TryLoad());
+			// Already resident -- PrepareDataInternal async-loaded every per-point rock
+			// path, so ResolveObject() returns the loaded mesh without a sync load.
+			UStaticMesh* Mesh = Cast<UStaticMesh>(FSoftObjectPath(MeshPath).ResolveObject());
 			if (!Mesh)
 			{
 				continue;
 			}
-			RockInputs.Add({ Mesh, P.Transform, P.Seed });
+			RockInputs.Add({ Mesh, TransformRange[PointIdx], SeedRange[PointIdx] });
 		}
 	}
 
-	// ── Fallback: find actors by tag ──
+	// ── Fallback: actors-by-tag discovery resolved during PrepareData ──
+	// The TActorIterator world walk is game-thread-only, so it ran in PrepareDataInternal
+	// and cached its results on the context. Here (on a worker thread) we just resolve the
+	// already-resident meshes via .Get() and feed them into RockInputs.
 	if (!bHasInputPin && !Settings->ActorTagFallback.IsNone())
 	{
-		for (TActorIterator<AActor> It(World); It; ++It)
+		FPCGMeshSurfaceScatterContext* ThisContext = static_cast<FPCGMeshSurfaceScatterContext*>(Context);
+		for (const FPCGMeshSurfaceScatterContext::FFallbackRock& Rock : ThisContext->FallbackRocks)
 		{
-			AActor* Actor = *It;
-			if (!Actor->ActorHasTag(Settings->ActorTagFallback))
+			// Resident after PrepareData's async load -- .Get() returns without a sync load.
+			UStaticMesh* Mesh = Rock.Mesh.Get();
+			if (!Mesh)
 			{
 				continue;
 			}
-			TArray<UStaticMeshComponent*> SMCs;
-			Actor->GetComponents<UStaticMeshComponent>(SMCs);
-			for (UStaticMeshComponent* SMC : SMCs)
-			{
-				UStaticMesh* Mesh = SMC->GetStaticMesh();
-				if (!Mesh)
-				{
-					continue;
-				}
-				RockInputs.Add({ Mesh, SMC->GetComponentTransform(), 0 });
-			}
+			RockInputs.Add({ Mesh, Rock.WorldTransform, 0 });
 		}
 	}
 
 	if (RockInputs.Num() == 0)
 	{
-		PCGE_LOG(Warning, GraphAndLog, NSLOCTEXT("PCGMeshSurfaceScatter", "NoRocks",
+		PCGE_LOG_C(Warning, GraphAndLog, Context, NSLOCTEXT("PCGMeshSurfaceScatter", "NoRocks",
 			"Mesh Surface Scatter: No rock meshes found to sample."));
 		return true;
 	}
 
 	// ── Prepare outputs ──
+	// This node generates a variable number of points, so we accumulate plain-old-data
+	// during sampling and build the UPCGBasePointData (SetNumPoints + AllocateProperties
+	// + value-range fill) once the counts are known.
 	TArray<FPCGTaggedData>& Outputs = Context->OutputData.TaggedData;
 
-	UPCGPointData* OutData = NewObject<UPCGPointData>();
-	OutData->InitializeFromData(nullptr);
-	TArray<FPCGPoint>& OutPoints = OutData->GetMutablePoints();
-	UPCGMetadata* OutMeta = OutData->MutableMetadata();
-
-	FPCGMetadataAttribute<FString>* MeshPathAttr =
-		OutMeta->FindOrCreateAttribute<FString>(
-			Settings->OutputMeshPathAttribute, FString(),
-			/*bAllowInterpolation=*/false, /*bOverrideParent=*/true);
-
-	UPCGPointData* RejData = nullptr;
-	TArray<FPCGPoint>* RejPoints = nullptr;
-	if (Settings->bOutputRejected)
+	// Accepted-point accumulators.
+	struct FAcceptedPoint
 	{
-		RejData = NewObject<UPCGPointData>();
-		RejData->InitializeFromData(nullptr);
-		RejPoints = &RejData->GetMutablePoints();
-	}
+		FTransform Transform;
+		int32 Seed;
+		FSoftObjectPath MeshPath;
+	};
+	TArray<FAcceptedPoint> AcceptedPoints;
+
+	// Rejected-point accumulators (debug only).
+	struct FRejectedPoint
+	{
+		FVector Location;
+		float Density;
+	};
+	TArray<FRejectedPoint> RejectedPoints;
+	const bool bOutputRejected = Settings->bOutputRejected;
 
 	// ── Landscape trace setup ──
 	FCollisionQueryParams TraceParams;
@@ -644,9 +755,13 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 	TraceParams.bReturnPhysicalMaterial = false;
 
 	// ── Min-distance grid (global across all rocks so grass from adjacent rocks doesn't overlap) ──
+	// TODO(audit): FMinDistGrid bins by XY only, so a point on an overhead surface is
+	// suppressed by a projected base point directly below it (same XY, different Z). On
+	// stacked/overhanging geometry this thins out the upper surface. Decide
+	// whether the spacing test should be fully 3D (cell + Z bucket) or stay XY-projected.
 	const float MinDist = FMath::Max(Settings->MinDistance, 0.0f);
 	const float MinDistSq = MinDist * MinDist;
-	FMinDistGrid SpacingGrid;
+	PCGExtScatterCommon::FMinDistGrid SpacingGrid;
 	SpacingGrid.CellSize = FMath::Max(MinDist, 1.0f);
 
 	const int32 BaseSeed = Settings->GetSeed(Context->ExecutionSource.Get());
@@ -693,7 +808,7 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 		}
 
 		// 3. Determine sample count from area × density.
-		const double AreaSqM = TotalEligibleArea * SqCmToSqM;
+		const double AreaSqM = TotalEligibleArea * PCGMeshSurfaceScatter::SqCmToSqM;
 		const int32 TargetCount = FMath::Max(1, FMath::RoundToInt(AreaSqM * Settings->PointsPerSquareMeter));
 
 		const int32 RockSeed = PCGHelpers::ComputeSeed(BaseSeed, Rock.Seed + RockIdx);
@@ -704,6 +819,10 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 		for (int32 SampleIdx = 0; SampleIdx < TargetCount; ++SampleIdx)
 		{
 			// 4a. Area-weighted triangle selection.
+			// TODO(audit) perf: this is a linear scan of the area CDF per sample --
+			// O(samples * eligibleTris). CumulativeArea is monotonic, so Algo::UpperBound
+			// over the eligible-tri CDF would make this O(samples * log(eligibleTris)).
+			// Left as-is here to keep the migration behaviour-preserving.
 			const float AreaRoll = Rng.FRandRange(0.0f, TotalEligibleArea);
 			int32 ChosenEligible = 0;
 			for (int32 E = 0; E < EligibleTris.Num(); ++E)
@@ -737,7 +856,7 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 
 				// Find the landscape hit by actor type — capture both Z and normal.
 				float LandscapeZ = -BIG_NUMBER;
-				FVector LandscapeNormal = WorldUp;
+				FVector LandscapeNormal = PCGExtScatterCommon::WorldUp;
 				for (const FHitResult& H : Hits)
 				{
 					AActor* HitActor = H.GetActor();
@@ -768,12 +887,9 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 						}
 						else
 						{
-							if (RejPoints)
+							if (bOutputRejected)
 							{
-								FPCGPoint Rej;
-								Rej.Transform.SetLocation(SamplePos);
-								Rej.Density = 0.0f;
-								RejPoints->Add(Rej);
+								RejectedPoints.Add({ SamplePos, 0.0f });
 							}
 							continue;
 						}
@@ -792,12 +908,9 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 				const float NoiseVal = FMath::Clamp(0.5f * (N + 1.0f), 0.0f, 1.0f);
 				if (NoiseVal < Settings->NoiseDensityMin)
 				{
-					if (RejPoints)
+					if (bOutputRejected)
 					{
-						FPCGPoint Rej;
-						Rej.Transform.SetLocation(SamplePos);
-						Rej.Density = NoiseVal;
-						RejPoints->Add(Rej);
+						RejectedPoints.Add({ SamplePos, NoiseVal });
 					}
 					continue;
 				}
@@ -806,12 +919,9 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 			// 7. Min-distance pruning.
 			if (MinDist > 0.0f && SpacingGrid.HasWithin(SamplePos, MinDistSq))
 			{
-				if (RejPoints)
+				if (bOutputRejected)
 				{
-					FPCGPoint Rej;
-					Rej.Transform.SetLocation(SamplePos);
-					Rej.Density = 0.0f;
-					RejPoints->Add(Rej);
+					RejectedPoints.Add({ SamplePos, 0.0f });
 				}
 				continue;
 			}
@@ -849,21 +959,18 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 				? Settings->LandscapeGrassZOffset : Settings->ZOffset;
 			const FVector FinalPos = SamplePos + SampleNormal * ActiveZOffset;
 
-			FPCGPoint NewPoint;
-			NewPoint.Seed = PointSeed;
-			NewPoint.Density = Settings->bWriteDensity ? 1.0f : 1.0f;
-			NewPoint.Steepness = 1.0f;
-			NewPoint.SetExtents(FVector(8.0f));
-			NewPoint.Transform = FTransform(Rot, FinalPos, FVector(FinalScale));
+			// TODO(audit): bWriteDensity currently has no effect -- density is written as a
+			// constant 1.0f either way (the original `bWriteDensity ? 1.0f : 1.0f` no-op).
+			// The computed noise value (NoiseVal) is local to the noise block above and not
+			// in scope here, so no value is fabricated. Decide what density should
+			// be written when bWriteDensity is true (e.g. plumb NoiseVal through), and what
+			// it should be when false.
+			FAcceptedPoint Accepted;
+			Accepted.Transform = FTransform(Rot, FinalPos, FVector(FinalScale));
+			Accepted.Seed = PointSeed;
+			Accepted.MeshPath = Chosen.MeshPath;
+			AcceptedPoints.Add(Accepted);
 
-			NewPoint.MetadataEntry = PCGInvalidEntryKey;
-			OutMeta->InitializeOnSet(NewPoint.MetadataEntry);
-			if (MeshPathAttr)
-			{
-				MeshPathAttr->SetValue(NewPoint.MetadataEntry, Chosen.MeshPath.ToString());
-			}
-
-			OutPoints.Add(NewPoint);
 			if (MinDist > 0.0f)
 			{
 				SpacingGrid.Add(SamplePos);
@@ -884,7 +991,7 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 					"area=%.1f sqm  target=%d  accepted=%d  submerged=%d  projected=%d"),
 				RockIdx, *Rock.Mesh->GetName(),
 				Tris.Num(), EligibleTris.Num(),
-				TotalEligibleArea * SqCmToSqM, TargetCount,
+				TotalEligibleArea * PCGMeshSurfaceScatter::SqCmToSqM, TargetCount,
 				RockAccepted, RockSubmerged, RockProjected);
 		}
 #endif
@@ -899,18 +1006,80 @@ bool FPCGMeshSurfaceScatterElement::ExecuteInternal(FPCGContext* Context) const
 	}
 #endif
 
-	// ── Emit ──
-	if (OutPoints.Num() > 0)
+	// ── Emit accepted points (generate pattern) ──
+	if (AcceptedPoints.Num() > 0)
 	{
+		const int32 NumAccepted = AcceptedPoints.Num();
+
+		UPCGBasePointData* OutData = FPCGContext::NewPointData_AnyThread(Context);
+		OutData->SetNumPoints(NumAccepted, /*bInitializeValues=*/false);
+		OutData->AllocateProperties(
+			EPCGPointNativeProperties::Transform |
+			EPCGPointNativeProperties::Seed |
+			EPCGPointNativeProperties::MetadataEntry);
+
+		// Uniform native properties (same for every accepted point).
+		OutData->SetDensity(1.0f);
+		OutData->SetSteepness(1.0f);
+		OutData->SetExtents(FVector(8.0f));
+
+		UPCGMetadata* OutMeta = OutData->MutableMetadata();
+
+		// Soft-object-path attribute so the By-Attribute Static Mesh Spawner consumes
+		// the mesh path natively (was previously stored as an FString).
+		OutMeta->CreateSoftObjectPathAttribute(
+			Settings->OutputMeshPathAttribute, FSoftObjectPath(), /*bAllowsInterpolation=*/false);
+		FPCGMetadataAttribute<FSoftObjectPath>* MeshPathAttr =
+			OutMeta->GetMutableTypedAttribute<FSoftObjectPath>(Settings->OutputMeshPathAttribute);
+
+		TPCGValueRange<FTransform> TransformRange = OutData->GetTransformValueRange();
+		TPCGValueRange<int32> SeedRange = OutData->GetSeedValueRange();
+		TPCGValueRange<int64> MetadataEntryRange = OutData->GetMetadataEntryValueRange();
+
+		for (int32 i = 0; i < NumAccepted; ++i)
+		{
+			const FAcceptedPoint& Accepted = AcceptedPoints[i];
+			TransformRange[i] = Accepted.Transform;
+			SeedRange[i] = Accepted.Seed;
+
+			MetadataEntryRange[i] = PCGInvalidEntryKey;
+			OutMeta->InitializeOnSet(MetadataEntryRange[i]);
+			if (MeshPathAttr)
+			{
+				MeshPathAttr->SetValue(MetadataEntryRange[i], Accepted.MeshPath);
+			}
+		}
+
 		FPCGTaggedData& T = Outputs.Emplace_GetRef();
 		T.Data = OutData;
 		T.Pin = PCGPinConstants::DefaultOutputLabel;
 	}
-	if (RejData && RejPoints && RejPoints->Num() > 0)
+
+	// ── Emit rejected points (debug only; no mesh attribute) ──
+	if (bOutputRejected && RejectedPoints.Num() > 0)
 	{
+		const int32 NumRejected = RejectedPoints.Num();
+
+		UPCGBasePointData* RejData = FPCGContext::NewPointData_AnyThread(Context);
+		RejData->SetNumPoints(NumRejected, /*bInitializeValues=*/false);
+		RejData->AllocateProperties(
+			EPCGPointNativeProperties::Transform |
+			EPCGPointNativeProperties::Density);
+
+		RejData->SetSteepness(1.0f);
+
+		TPCGValueRange<FTransform> RejTransformRange = RejData->GetTransformValueRange();
+		TPCGValueRange<float> RejDensityRange = RejData->GetDensityValueRange();
+
+		for (int32 i = 0; i < NumRejected; ++i)
+		{
+			RejTransformRange[i] = FTransform(RejectedPoints[i].Location);
+			RejDensityRange[i] = RejectedPoints[i].Density;
+		}
+
 		FPCGTaggedData& T = Outputs.Emplace_GetRef();
 		T.Data = RejData;
-		T.Pin = RejectedLabel;
+		T.Pin = PCGExtScatterCommon::RejectedPinLabel;
 	}
 
 	return true;

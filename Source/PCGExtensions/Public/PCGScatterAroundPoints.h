@@ -195,6 +195,9 @@ public:
 
 class PCGEXTENSIONS_API FPCGScatterAroundPointsElement : public IPCGElement
 {
+	// Line tracing is thread-safe and this node loads no resources, so it stays on the
+	// default worker-thread execution (no CanExecuteOnlyOnMainThread override).
 protected:
+	virtual bool SupportsBasePointDataInputs(FPCGContext* InContext) const override { return true; }
 	virtual bool ExecuteInternal(FPCGContext* Context) const override;
 };
